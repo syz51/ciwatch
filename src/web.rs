@@ -29,7 +29,14 @@ pub struct AppState {
     pub webhook_secret: Option<Arc<[u8]>>,
 }
 
+/// Every route on one listener: the page, its JSON, metrics and the webhook.
 pub fn router(state: AppState) -> Router {
+    page_router(state.clone()).merge(webhook_router(state))
+}
+
+/// The page, `/api/jobs`, `/metrics` and `/healthz`, without the webhook, for
+/// a listener next to a separate [`webhook_router`] one.
+pub fn page_router(state: AppState) -> Router {
     Router::new()
         .route(
             "/",
@@ -46,6 +53,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/jobs", get(jobs))
         .route("/metrics", get(metrics))
         .route("/healthz", get(|| async { "ok\n" }))
+        .with_state(state)
+}
+
+/// Only `POST /webhooks/github`, for a listener that is reachable from the
+/// internet; every other path is 404.
+pub fn webhook_router(state: AppState) -> Router {
+    Router::new()
         .route("/webhooks/github", post(github_webhook))
         .with_state(state)
 }

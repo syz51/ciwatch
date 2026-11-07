@@ -58,3 +58,24 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: docker build --pull --platform linux/amd64 -t ciwatch:ci .
+      - name: Check the image runs as nonroot and validates a config
+        run: |
+          user=$(docker image inspect --format '{{.Config.User}}' ciwatch:ci)
+          echo "image user: $user"
+          case "${user%%:*}" in
+            ''|root|0) echo "the image runs as root"; exit 1 ;;
+          esac
+          docker run --rm --entrypoint /usr/local/bin/ciwatch ciwatch:ci --version
+          printf '[circleci]\ntoken = { env = "T" }\nprojects = ["gh/o/r"]\n' > "$RUNNER_TEMP/c.toml"
+          docker run --rm -e T=x -v "$RUNNER_TEMP/c.toml:/etc/ciwatch/ciwatch.toml:ro" ciwatch:ci --config /etc/ciwatch/ciwatch.toml --check
