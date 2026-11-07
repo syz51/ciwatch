@@ -1,0 +1,36 @@
+[package]
+name = "ciwatch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "One live view of CI jobs across GitHub Actions, CircleCI and self-hosted runner pools"
+license = "MIT"
+repository = "https://github.com/syz51/ciwatch"
+readme = "README.md"
+keywords = ["ci", "github-actions", "circleci", "dashboard", "prometheus"]
+categories = ["development-tools", "web-programming::http-server"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "clock", "std"] }
+clap = { version = "4.6.7", features = ["derive"] }
+hex = "0.4.3"
+hmac = "0.13.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "http2", "query"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }

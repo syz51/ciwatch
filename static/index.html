@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ciwatch</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <h1>ciwatch</h1>
+    <p class="updated" id="updated" aria-live="polite">Loading…</p>
+  </header>
+  <main>
+    <section aria-labelledby="sources-heading" class="sources-section">
+      <h2 id="sources-heading" class="visually-hidden">Sources</h2>
+      <ul class="sources" id="sources"></ul>
+    </section>
+
+    <section aria-labelledby="pools-heading">
+      <h2 id="pools-heading">Pools</h2>
+      <ul class="pools" id="pools"></ul>
+      <p class="empty" id="pools-empty" hidden>No jobs yet.</p>
+    </section>
+
+    <section aria-labelledby="jobs-heading">
+      <div class="jobs-head">
+        <h2 id="jobs-heading">Jobs</h2>
+        <div class="controls">
+          <div class="segmented" role="group" aria-label="Show">
+            <button type="button" data-view="active" aria-pressed="true">Active <span id="count-active">0</span></button>
+            <button type="button" data-view="finished" aria-pressed="false">Finished <span id="count-finished">0</span></button>
+          </div>
+          <label class="filter">
+            <span class="visually-hidden">Filter jobs</span>
+            <input type="search" id="filter" placeholder="Filter by repository, job, branch or pool" autocomplete="off">
+          </label>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="jobs">
+          <thead>
+            <tr>
+              <th scope="col">State</th>
+              <th scope="col">Job</th>
+              <th scope="col">Repository</th>
+              <th scope="col">Branch</th>
+              <th scope="col">Pool</th>
+              <th scope="col" class="num">Time</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="jobs-empty" hidden></p>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,48 @@
+# ciwatch configuration. Secrets are never written here: each one names an
+# environment variable (`{ env = "NAME" }`) or a file (`{ file = "path" }`,
+# relative to this file).
+
+# Address the page, /api/jobs, /metrics and the webhook listen on.
+listen = "127.0.0.1:8080"
+
+# Jobs not updated for this long are dropped.
+retention_hours = 24
+
+[github]
+# Enables POST /webhooks/github. Subscribe the webhook (or GitHub App) to
+# "Workflow jobs" with content type application/json and this secret.
+webhook_secret = { env = "CIWATCH_GITHUB_WEBHOOK_SECRET" }
+
+# Optional: poll these repositories for queued and in-progress runs, which
+# fills the view at start-up and repairs missed deliveries. Needs a token
+# that can read Actions (fine-grained: "Actions: Read").
+token = { env = "CIWATCH_GITHUB_TOKEN" }
+repositories = ["your-org/your-repo"]
+poll_interval_secs = 60
+# api_url = "https://api.github.com"  # GitHub Enterprise: https://HOST/api/v3
+
+[circleci]
+# A CircleCI API token that can read the projects below.
+token = { file = "circleci-token" }
+# Project slugs: gh/ORG/REPO, bb/ORG/REPO, or circleci/ORG_ID/PROJECT_ID.
+projects = ["gh/your-org/your-repo"]
+poll_interval_secs = 30
+# Pipelines created within this many hours are polled.
+lookback_hours = 6
+
+# Pools group jobs by where they run. Rules are checked in order; every
+# condition a rule sets must match. Without a match, GitHub jobs fall into
+# "github-hosted", "self-hosted" or (queued, no runner yet) "unassigned",
+# and CircleCI jobs into "circleci".
+[[pools]]
+name = "build-farm"
+labels_any = ["build-farm"]
+
+[[pools]]
+name = "build-farm"
+runner_prefix = "farm-"
+
+[[pools]]
+name = "circleci-deploy"
+provider = "circleci"
+job_prefix = "deploy"
