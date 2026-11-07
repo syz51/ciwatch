@@ -123,7 +123,7 @@ docker run --read-only -p 127.0.0.1:8080:8080 \
   -e CIWATCH_GITHUB_WEBHOOK_SECRET -e CIWATCH_GITHUB_TOKEN \
   -v "$PWD/ciwatch.toml:/etc/ciwatch/ciwatch.toml:ro" \
   -v "$PWD/circleci-token:/etc/ciwatch/circleci-token:ro" \
-  ghcr.io/syz51/ciwatch:v0.1.0
+  ghcr.io/syz51/ciwatch:v0.1.1
 ```
 
 Set `listen = "0.0.0.0:8080"` in that file so the published port reaches it.
