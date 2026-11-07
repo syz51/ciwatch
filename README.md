@@ -80,7 +80,7 @@ job up.
 | `/api/jobs` | JSON: `jobs`, plus `sources` with each source's last success and last error |
 | `/metrics` | Prometheus text format |
 | `/healthz` | `ok` |
-| `POST /webhooks/github` | GitHub webhook receiver (only when `webhook_secret` is set) |
+| `POST /webhooks/github` | GitHub webhook receiver, when `webhook_secret` is set; on `webhook_listen` instead when that is set |
 
 ### Metrics
 
@@ -120,10 +120,16 @@ reads `/etc/ciwatch/ciwatch.toml`:
 
 ```sh
 docker run --read-only -p 127.0.0.1:8080:8080 \
-  -v "$PWD/ciwatch.toml:/etc/ciwatch/ciwatch.toml:ro" ghcr.io/syz51/ciwatch:v0.1.0
+  -e CIWATCH_GITHUB_WEBHOOK_SECRET -e CIWATCH_GITHUB_TOKEN \
+  -v "$PWD/ciwatch.toml:/etc/ciwatch/ciwatch.toml:ro" \
+  -v "$PWD/circleci-token:/etc/ciwatch/circleci-token:ro" \
+  ghcr.io/syz51/ciwatch:v0.1.0
 ```
 
 Set `listen = "0.0.0.0:8080"` in that file so the published port reaches it.
+The example passes the secrets that `ciwatch.example.toml` names, since a
+secret file resolves next to the config file. With `webhook_listen`, also
+publish its port.
 Verify an image with `gh attestation verify oci://ghcr.io/syz51/ciwatch:<tag> -R syz51/ciwatch`.
 
 ## Security
@@ -136,6 +142,11 @@ Verify an image with `gh attestation verify oci://ghcr.io/syz51/ciwatch:<tag> -R
 - To receive webhooks from the internet without exposing the page, set
   `webhook_listen` and route only that address to the internet. It serves
   `POST /webhooks/github` and nothing else.
+- Each listener closes a connection that has not sent a request's headers
+  within 10 seconds, answers 408 to a request that takes over 30 seconds,
+  accepts at most 256 connections at once, and drops connections still open
+  10 seconds after shutdown starts. It speaks HTTP/1 only. A reverse proxy in
+  front can enforce tighter limits per client.
 - Give ciwatch read-only credentials. It never triggers, cancels or reruns
   anything.
 - The page is served with `Content-Security-Policy: default-src 'self'`.

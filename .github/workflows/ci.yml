@@ -73,7 +73,9 @@ jobs:
         run: |
           user=$(docker image inspect --format '{{.Config.User}}' ciwatch:ci)
           echo "image user: $user"
-          test -n "$user" && test "$user" != root && test "$user" != 0
+          case "${user%%:*}" in
+            ''|root|0) echo "the image runs as root"; exit 1 ;;
+          esac
           docker run --rm --entrypoint /usr/local/bin/ciwatch ciwatch:ci --version
           printf '[circleci]\ntoken = { env = "T" }\nprojects = ["gh/o/r"]\n' > "$RUNNER_TEMP/c.toml"
           docker run --rm -e T=x -v "$RUNNER_TEMP/c.toml:/etc/ciwatch/ciwatch.toml:ro" ciwatch:ci --config /etc/ciwatch/ciwatch.toml --check

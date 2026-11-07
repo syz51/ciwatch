@@ -8,8 +8,9 @@ use tokio::task::JoinSet;
 
 use ciwatch::config::Config;
 use ciwatch::pools::Pools;
+use ciwatch::server::{self, Limits};
 use ciwatch::store::Store;
-use ciwatch::web::{AppState, router, webhook_router};
+use ciwatch::web::{AppState, page_router, router, webhook_router};
 use ciwatch::{circleci, github, http_client};
 
 /// One live view of CI jobs across GitHub Actions, CircleCI and runner pools.
@@ -77,62 +78,57 @@ async fn main() -> Result<()> {
         webhook_secret,
     };
     // With a separate webhook listener, the main one serves no webhook.
-    let (app, hooks) = match webhook_listen {
-        Some(addr) => {
-            let page = AppState {
-                webhook_secret: None,
-                ..state.clone()
-            };
-            (router(page), Some((addr, webhook_router(state))))
-        }
-        None => (router(state), None),
+    let listeners = match webhook_listen {
+        Some(addr) => vec![
+            (config.listen, page_router(state.clone())),
+            (addr, webhook_router(state)),
+        ],
+        None => vec![(config.listen, router(state))],
     };
 
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
-        let _ = stop_tx.send(());
+        stop_tx.send_replace(true);
     });
-    let stopped = |mut rx: tokio::sync::watch::Receiver<()>| async move {
-        let _ = rx.changed().await;
+    let stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        if rx.wait_for(|stop| *stop).await.is_err() {
+            tracing::error!("the shutdown signal task ended without a signal; shutting down");
+        }
     };
 
     let mut servers = JoinSet::new();
-    for (addr, app) in std::iter::once((config.listen, app)).chain(hooks) {
+    for (addr, app) in listeners {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding {addr}"))?;
         tracing::info!(listen = %addr, "ciwatch serving");
-        let stop = stopped(stop_rx.clone());
-        servers.spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(stop)
-                .await
-                .with_context(|| format!("serving HTTP on {addr}"))
-        });
+        servers.spawn(server::serve(
+            listener,
+            app,
+            Limits::default(),
+            stopped(stop_rx.clone()),
+        ));
     }
 
-    // Servers return only after shutdown or on error; background tasks loop
-    // forever, so one ending means it panicked.
-    let served = tokio::select! {
-        Some(result) = servers.join_next() => {
-            let result = result.context("HTTP server task").and_then(|r| r);
-            if result.is_ok() {
-                // Shutdown: let the other listener finish gracefully too.
-                while let Some(other) = servers.join_next().await {
-                    other.context("HTTP server task").and_then(|r| r)?;
-                }
-            } else {
-                servers.abort_all();
-            }
-            result
-        }
-        Some(ended) = tasks.join_next() => {
-            Err(anyhow::anyhow!("a background task stopped: {ended:?}"))
-        }
+    // Servers return only after shutdown; background tasks loop forever, so
+    // either ending otherwise means it panicked.
+    let mut result = tokio::select! {
+        Some(served) = servers.join_next() => served.context("HTTP server task"),
+        Some(ended) = tasks.join_next() => Err(anyhow::anyhow!("a background task stopped: {ended:?}")),
     };
+    if result.is_ok() {
+        // Shutdown: the other listener drains too.
+        while let Some(other) = servers.join_next().await {
+            if let Err(e) = other {
+                result = Err(anyhow::Error::new(e).context("HTTP server task"));
+            }
+        }
+    } else {
+        servers.abort_all();
+    }
     tasks.shutdown().await;
-    served
+    result
 }
 
 async fn shutdown_signal() {

@@ -1,2 +1,7 @@
-/target
-/.git
+# Send only what the build reads, so local configs and secrets stay out.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!src/
+!static/

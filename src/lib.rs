@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod model;
 pub mod poll;
 pub mod pools;
+pub mod server;
 pub mod store;
 pub mod web;
 

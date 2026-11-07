@@ -2,7 +2,8 @@
 # environment variable (`{ env = "NAME" }`) or a file (`{ file = "path" }`,
 # relative to this file).
 
-# Address the page, /api/jobs, /metrics and the webhook listen on.
+# Address the page, /api/jobs, /metrics and, without github.webhook_listen,
+# the webhook listen on.
 listen = "127.0.0.1:8080"
 
 # Jobs not updated for this long are dropped.

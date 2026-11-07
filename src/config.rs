@@ -194,8 +194,8 @@ impl Config {
                         "github.webhook_listen needs github.webhook_secret"
                     );
                     ensure!(
-                        addr != raw.listen,
-                        "github.webhook_listen must differ from listen"
+                        !binds_overlap(addr, raw.listen),
+                        "github.webhook_listen and listen bind the same port"
                     );
                 }
                 Ok(GithubConfig {
@@ -277,6 +277,14 @@ fn http_url(key: &str, value: &str) -> Result<String> {
         "{key} {value:?} must not have a query or fragment"
     );
     Ok(value.trim_end_matches('/').to_owned())
+}
+
+/// Whether binding both addresses would conflict: the same fixed port on the
+/// same address, or with either on every address (`0.0.0.0`, `[::]`).
+fn binds_overlap(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 fn is_owner_repo(s: &str) -> bool {
@@ -370,9 +378,44 @@ mod tests {
                 "[github]\nwebhook_secret = { file = \"missing\" }",
                 "reading secret file",
             ),
+            (
+                "[github]\ntoken = { file = \"secret\" }\nrepositories = [\"a/b\"]\nwebhook_listen = \"127.0.0.1:8081\"",
+                "webhook_listen needs github.webhook_secret",
+            ),
+            (
+                "listen = \"0.0.0.0:8080\"\n[github]\nwebhook_secret = { file = \"secret\" }\nwebhook_listen = \"127.0.0.1:8080\"",
+                "bind the same port",
+            ),
+            (
+                "listen = \"127.0.0.1:8080\"\n[github]\nwebhook_secret = { file = \"secret\" }\nwebhook_listen = \"[::]:8080\"",
+                "bind the same port",
+            ),
+            (
+                "[github]\nwebhook_secret = { file = \"secret\" }\nwebhook_listen = \"127.0.0.1:8080\"",
+                "bind the same port",
+            ),
         ] {
             let err = format!("{:#}", Config::parse(text, base).unwrap_err());
             assert!(err.contains(expected), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_a_separate_webhook_listener() {
+        let dir = SecretDir::new("webhook-listen");
+        for (listen, webhook) in [
+            ("127.0.0.1:8080", "172.19.0.1:8080"),
+            ("127.0.0.1:8080", "0.0.0.0:8081"),
+            ("127.0.0.1:0", "127.0.0.1:0"),
+        ] {
+            let text = format!(
+                "listen = \"{listen}\"\n[github]\nwebhook_secret = {{ file = \"secret\" }}\nwebhook_listen = \"{webhook}\""
+            );
+            let config = Config::parse(&text, &dir.0).unwrap_or_else(|e| panic!("{text:?}: {e:#}"));
+            assert_eq!(
+                config.github.unwrap().webhook_listen,
+                Some(webhook.parse().unwrap())
+            );
         }
     }
 }
