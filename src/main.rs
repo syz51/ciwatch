@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 use ciwatch::config::Config;
 use ciwatch::pools::Pools;
 use ciwatch::store::Store;
-use ciwatch::web::{AppState, router};
+use ciwatch::web::{AppState, router, webhook_router};
 use ciwatch::{circleci, github, http_client};
 
 /// One live view of CI jobs across GitHub Actions, CircleCI and runner pools.
@@ -44,7 +44,9 @@ async fn main() -> Result<()> {
     let mut tasks = JoinSet::new();
 
     let mut webhook_secret = None;
+    let mut webhook_listen = None;
     if let Some(gh) = &config.github {
+        webhook_listen = gh.webhook_listen;
         if let Some(secret) = &gh.webhook_secret {
             store.register_source(github::SOURCE_WEBHOOK);
             webhook_secret = Some(Arc::from(secret.as_bytes()));
@@ -69,20 +71,61 @@ async fn main() -> Result<()> {
         }
     });
 
-    let app = router(AppState {
+    let state = AppState {
         store,
         pools,
         webhook_secret,
-    });
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("binding {}", config.listen))?;
-    tracing::info!(listen = %config.listen, "ciwatch serving");
+    };
+    // With a separate webhook listener, the main one serves no webhook.
+    let (app, hooks) = match webhook_listen {
+        Some(addr) => {
+            let page = AppState {
+                webhook_secret: None,
+                ..state.clone()
+            };
+            (router(page), Some((addr, webhook_router(state))))
+        }
+        None => (router(state), None),
+    };
 
-    // The background tasks loop forever; one ending means it panicked.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = stop_tx.send(());
+    });
+    let stopped = |mut rx: tokio::sync::watch::Receiver<()>| async move {
+        let _ = rx.changed().await;
+    };
+
+    let mut servers = JoinSet::new();
+    for (addr, app) in std::iter::once((config.listen, app)).chain(hooks) {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding {addr}"))?;
+        tracing::info!(listen = %addr, "ciwatch serving");
+        let stop = stopped(stop_rx.clone());
+        servers.spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stop)
+                .await
+                .with_context(|| format!("serving HTTP on {addr}"))
+        });
+    }
+
+    // Servers return only after shutdown or on error; background tasks loop
+    // forever, so one ending means it panicked.
     let served = tokio::select! {
-        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
-            result.context("serving HTTP")
+        Some(result) = servers.join_next() => {
+            let result = result.context("HTTP server task").and_then(|r| r);
+            if result.is_ok() {
+                // Shutdown: let the other listener finish gracefully too.
+                while let Some(other) = servers.join_next().await {
+                    other.context("HTTP server task").and_then(|r| r)?;
+                }
+            } else {
+                servers.abort_all();
+            }
+            result
         }
         Some(ended) = tasks.join_next() => {
             Err(anyhow::anyhow!("a background task stopped: {ended:?}"))

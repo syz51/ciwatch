@@ -50,6 +50,14 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Only `POST /webhooks/github`, for a listener that is reachable from the
+/// internet; every other path is 404.
+pub fn webhook_router(state: AppState) -> Router {
+    Router::new()
+        .route("/webhooks/github", post(github_webhook))
+        .with_state(state)
+}
+
 fn asset(body: &'static str, content_type: &'static str) -> Response {
     let mut response = body.into_response();
     let headers = response.headers_mut();

@@ -12,6 +12,9 @@ retention_hours = 24
 # Enables POST /webhooks/github. Subscribe the webhook (or GitHub App) to
 # "Workflow jobs" with content type application/json and this secret.
 webhook_secret = { env = "CIWATCH_GITHUB_WEBHOOK_SECRET" }
+# Optional: serve the webhook only on this address, so a public route can reach
+# it without reaching the page, /api/jobs or /metrics.
+# webhook_listen = "0.0.0.0:8081"
 
 # Optional: poll these repositories for queued and in-progress runs, which
 # fills the view at start-up and repairs missed deliveries. Needs a token

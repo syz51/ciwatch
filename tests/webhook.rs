@@ -10,7 +10,7 @@ use tower::ServiceExt;
 
 use ciwatch::pools::{PoolRule, Pools};
 use ciwatch::store::Store;
-use ciwatch::web::{AppState, router};
+use ciwatch::web::{AppState, router, webhook_router};
 
 const SECRET: &[u8] = b"webhook-secret";
 
@@ -207,5 +207,28 @@ async fn page_assets_are_served_with_a_strict_policy() {
             response.headers()["content-security-policy"],
             "default-src 'self'; frame-ancestors 'none'"
         );
+    }
+}
+
+#[tokio::test]
+async fn webhook_listener_serves_only_the_webhook() {
+    let hooks = webhook_router(AppState {
+        store: Arc::new(Store::new(chrono::Duration::hours(1))),
+        pools: Arc::new(Pools::default()),
+        webhook_secret: Some(Arc::from(SECRET)),
+    });
+    let body = delivery("queued", "queued", None, None);
+    let signature = sign(&body);
+    assert_eq!(
+        post(&hooks, "workflow_job", body, Some(signature)).await,
+        StatusCode::ACCEPTED
+    );
+    for path in ["/", "/app.js", "/api/jobs", "/metrics", "/healthz"] {
+        let response = hooks
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
 }

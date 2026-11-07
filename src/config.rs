@@ -52,6 +52,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawGithub {
     webhook_secret: Option<SecretSource>,
+    webhook_listen: Option<SocketAddr>,
     token: Option<SecretSource>,
     #[serde(default)]
     repositories: Vec<String>,
@@ -113,6 +114,9 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct GithubConfig {
     pub webhook_secret: Option<String>,
+    /// When set, the webhook is served only on this address and not on
+    /// `listen`, so it can be exposed without exposing the page.
+    pub webhook_listen: Option<SocketAddr>,
     /// Present when repositories are polled.
     pub poll: Option<GithubPoll>,
 }
@@ -184,7 +188,21 @@ impl Config {
                     webhook_secret.is_some() || poll.is_some(),
                     "[github] needs webhook_secret, or token and repositories"
                 );
-                Ok(GithubConfig { webhook_secret, poll })
+                if let Some(addr) = g.webhook_listen {
+                    ensure!(
+                        webhook_secret.is_some(),
+                        "github.webhook_listen needs github.webhook_secret"
+                    );
+                    ensure!(
+                        addr != raw.listen,
+                        "github.webhook_listen must differ from listen"
+                    );
+                }
+                Ok(GithubConfig {
+                    webhook_secret,
+                    webhook_listen: g.webhook_listen,
+                    poll,
+                })
             })
             .transpose()?;
 

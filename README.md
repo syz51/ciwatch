@@ -45,6 +45,7 @@ keys are rejected.
 | top level | `listen` | `127.0.0.1:8080` | HTTP listen address |
 | | `retention_hours` | `24` | Drop jobs not updated for this long (1 to 8784) |
 | `[github]` | `webhook_secret` | none | Turns on `POST /webhooks/github` |
+| | `webhook_listen` | none | Serve the webhook only on this address, and not on `listen` |
 | | `token`, `repositories` | none | Poll these `owner/name` repositories; the token needs Actions read access |
 | | `poll_interval_secs` | `60` | At least 10 |
 | | `api_url` | `https://api.github.com` | GitHub Enterprise: `https://HOST/api/v3` |
@@ -111,6 +112,20 @@ Field names map to the OpenTelemetry CI/CD and VCS semantic conventions:
 | `branch` | `vcs.ref.head.name` |
 | `revision` | `vcs.ref.head.revision` |
 
+## Container image
+
+Each `v*` tag publishes `ghcr.io/syz51/ciwatch:<tag>` for linux/amd64, with
+a build provenance attestation. The image runs as an unprivileged user and
+reads `/etc/ciwatch/ciwatch.toml`:
+
+```sh
+docker run --read-only -p 127.0.0.1:8080:8080 \
+  -v "$PWD/ciwatch.toml:/etc/ciwatch/ciwatch.toml:ro" ghcr.io/syz51/ciwatch:v0.1.0
+```
+
+Set `listen = "0.0.0.0:8080"` in that file so the published port reaches it.
+Verify an image with `gh attestation verify oci://ghcr.io/syz51/ciwatch:<tag> -R syz51/ciwatch`.
+
 ## Security
 
 - The page, `/api/jobs` and `/metrics` have no authentication. Bind to
@@ -118,6 +133,9 @@ Field names map to the OpenTelemetry CI/CD and VCS semantic conventions:
   proxy. They show repository names, branches, job names and runner names.
 - Webhook deliveries are checked against `X-Hub-Signature-256`, and
   unsigned or mis-signed deliveries are refused.
+- To receive webhooks from the internet without exposing the page, set
+  `webhook_listen` and route only that address to the internet. It serves
+  `POST /webhooks/github` and nothing else.
 - Give ciwatch read-only credentials. It never triggers, cancels or reruns
   anything.
 - The page is served with `Content-Security-Policy: default-src 'self'`.
