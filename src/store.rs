@@ -48,7 +48,8 @@ impl Store {
     }
 
     /// Insert or update a job. A job never moves back to an earlier state; a
-    /// stale update only refreshes `observed_at`.
+    /// stale update only refreshes `observed_at`. A job with no `created_at`
+    /// gets the time ciwatch first saw it.
     pub fn upsert(&self, mut job: Job) {
         let mut jobs = self.jobs.write().expect("job store lock poisoned");
         match jobs.get_mut(&job.key()) {
@@ -56,24 +57,56 @@ impl Store {
                 existing.observed_at = existing.observed_at.max(job.observed_at);
             }
             Some(existing) => {
-                job.created_at = job.created_at.or(existing.created_at);
+                job.created_at = existing.created_at.or(job.created_at);
                 job.started_at = job.started_at.or(existing.started_at);
-                job.runner = job.runner.or_else(|| existing.runner.take());
+                if job.runner.is_none() && existing.runner.is_some() {
+                    // The pool was classified with the runner known; an
+                    // update without it cannot classify better.
+                    job.runner = existing.runner.take();
+                    job.pool = std::mem::take(&mut existing.pool);
+                }
                 *existing = job;
             }
             None => {
+                job.created_at = job.created_at.or(Some(job.observed_at));
                 jobs.insert(job.key(), job);
             }
         }
     }
 
-    /// Run ids of jobs from `provider` and `repository` that are still active.
+    /// Run ids of jobs from `provider` and `repository` (compared without
+    /// case, as GitHub does) that are still active.
     pub fn active_run_ids(&self, provider: Provider, repository: &str) -> HashSet<String> {
         let jobs = self.jobs.read().expect("job store lock poisoned");
         jobs.values()
-            .filter(|j| j.provider == provider && j.repository == repository && j.state.is_active())
+            .filter(|j| {
+                j.provider == provider && j.repository.eq_ignore_ascii_case(repository) && j.state.is_active()
+            })
             .map(|j| j.run_id.clone())
             .collect()
+    }
+
+    /// One active job per run from `provider`, as a template for refreshing
+    /// that run.
+    pub fn active_runs(&self, provider: Provider) -> Vec<Job> {
+        let jobs = self.jobs.read().expect("job store lock poisoned");
+        let mut seen = HashSet::new();
+        jobs.values()
+            .filter(|j| j.provider == provider && j.state.is_active() && seen.insert(j.run_id.clone()))
+            .cloned()
+            .collect()
+    }
+
+    /// Forget every job of one run.
+    pub fn remove_run(&self, provider: Provider, repository: &str, run_id: &str) {
+        self.jobs
+            .write()
+            .expect("job store lock poisoned")
+            .retain(|_, j| {
+                !(j.provider == provider
+                    && j.repository.eq_ignore_ascii_case(repository)
+                    && j.run_id == run_id)
+            });
     }
 
     /// Active jobs first, oldest first; then finished jobs, newest first.

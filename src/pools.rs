@@ -35,8 +35,16 @@ impl PoolRule {
 
     fn matches(&self, facts: &PoolFacts<'_>) -> bool {
         self.provider.is_none_or(|p| p == facts.provider)
-            && self.repository.as_deref().is_none_or(|r| r == facts.repository)
-            && (self.labels_any.is_empty() || self.labels_any.iter().any(|l| facts.labels.contains(l)))
+            // GitHub compares repository names and labels without case.
+            && self
+                .repository
+                .as_deref()
+                .is_none_or(|r| r.eq_ignore_ascii_case(facts.repository))
+            && (self.labels_any.is_empty()
+                || self
+                    .labels_any
+                    .iter()
+                    .any(|l| facts.labels.iter().any(|f| f.eq_ignore_ascii_case(l))))
             && self
                 .runner_prefix
                 .as_deref()

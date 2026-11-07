@@ -12,6 +12,8 @@ const SOURCE_LABEL = {
 
 let view = "active";
 let latest = null;
+// Server time minus browser time, so ages do not depend on the viewer's clock.
+let serverOffset = 0;
 let lastOk = null;
 
 const $ = (id) => document.getElementById(id);
@@ -168,7 +170,7 @@ function renderRows(jobs, now) {
 
 function render() {
   if (!latest) return;
-  const now = Date.now();
+  const now = Date.now() + serverOffset;
   renderSources(latest.sources, now);
   renderPools(latest.jobs, now);
   renderRows(latest.jobs, now);
@@ -179,6 +181,8 @@ async function refresh() {
     const res = await fetch("/api/jobs", { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     latest = await res.json();
+    const serverNow = Date.parse(latest.generated_at);
+    if (!Number.isNaN(serverNow)) serverOffset = serverNow - Date.now();
     lastOk = new Date();
     $("updated").textContent = `Updated ${lastOk.toLocaleTimeString()}`;
     render();

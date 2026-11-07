@@ -146,7 +146,7 @@ impl Config {
     /// Parse config text; relative secret files resolve against `base`.
     pub fn parse(text: &str, base: &Path) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text).context("parsing config")?;
-        ensure!(raw.retention_hours > 0, "retention_hours must be positive");
+        let retention = hours("retention_hours", raw.retention_hours)?;
 
         let github = raw
             .github
@@ -173,7 +173,7 @@ impl Config {
                             token: token.resolve(base).context("github.token")?,
                             repositories: g.repositories,
                             interval: Duration::from_secs(g.poll_interval_secs),
-                            api_url: g.api_url.trim_end_matches('/').to_owned(),
+                            api_url: http_url("github.api_url", &g.api_url)?,
                         })
                     }
                     (None, true) => None,
@@ -202,14 +202,13 @@ impl Config {
                     c.poll_interval_secs >= 5,
                     "circleci.poll_interval_secs must be at least 5"
                 );
-                ensure!(c.lookback_hours > 0, "circleci.lookback_hours must be positive");
                 Ok(CircleciConfig {
                     token: c.token.resolve(base).context("circleci.token")?,
                     projects: c.projects,
                     interval: Duration::from_secs(c.poll_interval_secs),
-                    lookback: chrono::Duration::hours(i64::try_from(c.lookback_hours)?),
-                    api_url: c.api_url.trim_end_matches('/').to_owned(),
-                    app_url: c.app_url.trim_end_matches('/').to_owned(),
+                    lookback: hours("circleci.lookback_hours", c.lookback_hours)?,
+                    api_url: http_url("circleci.api_url", &c.api_url)?,
+                    app_url: http_url("circleci.app_url", &c.app_url)?,
                 })
             })
             .transpose()?;
@@ -229,12 +228,37 @@ impl Config {
 
         Ok(Config {
             listen: raw.listen,
-            retention: chrono::Duration::hours(i64::try_from(raw.retention_hours)?),
+            retention,
             github,
             circleci,
             pools: raw.pools,
         })
     }
+}
+
+/// The longest retention or lookback accepted: one year.
+const MAX_HOURS: u64 = 24 * 366;
+
+fn hours(key: &str, value: u64) -> Result<chrono::Duration> {
+    ensure!(
+        (1..=MAX_HOURS).contains(&value),
+        "{key} must be between 1 and {MAX_HOURS}"
+    );
+    Ok(chrono::Duration::hours(i64::try_from(value)?))
+}
+
+/// An absolute http(s) URL, returned without a trailing slash.
+fn http_url(key: &str, value: &str) -> Result<String> {
+    let url = reqwest::Url::parse(value).with_context(|| format!("{key} {value:?} is not a URL"))?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host().is_some(),
+        "{key} {value:?} must be an http or https URL"
+    );
+    ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "{key} {value:?} must not have a query or fragment"
+    );
+    Ok(value.trim_end_matches('/').to_owned())
 }
 
 fn is_owner_repo(s: &str) -> bool {
@@ -246,16 +270,29 @@ fn is_owner_repo(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn base_with_secret() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ciwatch-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("secret"), "s3cret\n").unwrap();
-        dir
+    /// A directory holding a `secret` file, removed on drop. Each test names
+    /// its own, since tests run in parallel.
+    struct SecretDir(PathBuf);
+
+    impl SecretDir {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ciwatch-config-{}-{test}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("secret"), "s3cret\n").unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for SecretDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn parses_a_full_config() {
-        let base = base_with_secret();
+        let dir = SecretDir::new("full");
+        let base = &dir.0;
         let config = Config::parse(
             r#"
             listen = "0.0.0.0:9000"
@@ -270,7 +307,7 @@ mod tests {
             name = "sai"
             labels_any = ["sai-ephemeral"]
             "#,
-            &base,
+            base,
         )
         .unwrap();
         let github = config.github.unwrap();
@@ -282,8 +319,21 @@ mod tests {
 
     #[test]
     fn rejects_bad_configs() {
-        let base = base_with_secret();
+        let dir = SecretDir::new("bad");
+        let base = &dir.0;
         for (text, expected) in [
+            (
+                "retention_hours = 100000000\n[github]\nwebhook_secret = { file = \"secret\" }",
+                "between 1 and",
+            ),
+            (
+                "[github]\ntoken = { file = \"secret\" }\nrepositories = [\"a/b\"]\napi_url = \"api.github.com\"",
+                "github.api_url",
+            ),
+            (
+                "[circleci]\ntoken = { file = \"secret\" }\nprojects = [\"gh/a/b\"]\napp_url = \"ftp://x\"",
+                "http or https",
+            ),
             ("", "at least one"),
             ("[github]\nrepositories = [\"a/b\"]", "needs github.token"),
             (
@@ -303,7 +353,7 @@ mod tests {
                 "reading secret file",
             ),
         ] {
-            let err = format!("{:#}", Config::parse(text, &base).unwrap_err());
+            let err = format!("{:#}", Config::parse(text, base).unwrap_err());
             assert!(err.contains(expected), "{text:?}: {err}");
         }
     }

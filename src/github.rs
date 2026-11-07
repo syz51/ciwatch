@@ -3,14 +3,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::Sha256;
 
 use crate::config::GithubPoll;
 use crate::model::{Job, PoolFacts, Provider, State};
+use crate::poll::{Failures, Source, fetch_json, status_of};
 use crate::pools::Pools;
 use crate::store::Store;
 
@@ -144,67 +146,80 @@ impl Poller {
         }
     }
 
-    pub async fn run(self) {
-        let mut ticker = tokio::time::interval(self.config.interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            match self.poll_once().await {
-                Ok(()) => self.store.record_success(SOURCE_POLL, Utc::now()),
-                Err(e) => {
-                    tracing::warn!(error = format!("{e:#}"), "GitHub poll failed");
-                    self.store.record_error(SOURCE_POLL, Utc::now(), format!("{e:#}"));
-                }
-            }
-        }
-    }
-
-    /// Refresh every active run: those GitHub lists as queued, waiting or in
-    /// progress, and those ciwatch still holds as active, so a missed
+    /// Refresh one repository's active runs: those GitHub lists as not yet
+    /// finished, and those ciwatch still holds as active, so a missed
     /// completion webhook is repaired.
-    pub async fn poll_once(&self) -> Result<()> {
-        for repo in &self.config.repositories {
-            let mut runs: HashSet<String> = self.store.active_run_ids(Provider::Github, repo);
-            for status in ["queued", "waiting", "in_progress"] {
-                let list: RunList = self
-                    .get(
-                        &format!("/repos/{repo}/actions/runs"),
-                        &[("status", status), ("per_page", "100")],
-                    )
-                    .await?;
-                runs.extend(list.workflow_runs.into_iter().map(|r| r.id.to_string()));
-            }
-            for run in runs {
-                let list: JobList = self
-                    .get(
-                        &format!("/repos/{repo}/actions/runs/{run}/jobs"),
-                        &[("filter", "latest"), ("per_page", "100")],
-                    )
-                    .await?;
-                let now = Utc::now();
-                for job in list.jobs {
-                    self.store.upsert(to_job(job, repo, &self.pools, now));
-                }
+    async fn poll_repository(&self, repo: &str, failures: &mut Failures) {
+        let mut runs: HashSet<String> = self.store.active_run_ids(Provider::Github, repo);
+        for status in RUN_STATUSES {
+            let path = format!("/repos/{repo}/actions/runs");
+            match self
+                .get::<RunList>(&path, &[("status", status), ("per_page", "100")])
+                .await
+            {
+                Ok(list) => runs.extend(list.workflow_runs.into_iter().map(|r| r.id.to_string())),
+                Err(e) => failures.add(e),
             }
         }
-        Ok(())
+        for run in runs {
+            // `filter=all` includes earlier attempts, whose jobs may also be
+            // held as active.
+            let path = format!("/repos/{repo}/actions/runs/{run}/jobs");
+            match self
+                .get::<JobList>(&path, &[("filter", "all"), ("per_page", "100")])
+                .await
+            {
+                Ok(list) => {
+                    let now = Utc::now();
+                    for job in list.jobs {
+                        self.store.upsert(to_job(job, repo, &self.pools, now));
+                    }
+                }
+                // The run was deleted or its repository moved: nothing will
+                // ever finish it, so stop showing its jobs.
+                Err(e) if status_of(&e) == Some(StatusCode::NOT_FOUND) => {
+                    tracing::info!(repo, run, "run is gone; dropping its jobs");
+                    self.store.remove_run(Provider::Github, repo, &run);
+                }
+                Err(e) => failures.add(e),
+            }
+        }
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
-        let url = format!("{}{path}", self.config.api_url);
-        self.client
-            .get(&url)
+        let request = self
+            .client
+            .get(format!("{}{path}", self.config.api_url))
             .query(query)
             .bearer_auth(&self.config.token)
             .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .with_context(|| format!("GET {path}"))?
-            .json()
-            .await
-            .with_context(|| format!("decoding {path}"))
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        fetch_json(request, path).await
+    }
+}
+
+/// Run statuses that mean "not finished" in `GET /actions/runs?status=`.
+const RUN_STATUSES: [&str; 5] = ["requested", "pending", "queued", "waiting", "in_progress"];
+
+impl Source for Poller {
+    fn name(&self) -> &'static str {
+        SOURCE_POLL
+    }
+
+    fn interval(&self) -> std::time::Duration {
+        self.config.interval
+    }
+
+    fn store(&self) -> &Store {
+        &self.store
+    }
+
+    async fn poll_once(&self) -> Result<()> {
+        let mut failures = Failures::default();
+        for repo in &self.config.repositories {
+            self.poll_repository(repo, &mut failures).await;
+        }
+        failures.into_result()
     }
 }
 

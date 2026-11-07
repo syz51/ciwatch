@@ -43,14 +43,14 @@ keys are rejected.
 | Section | Key | Default | Meaning |
 | --- | --- | --- | --- |
 | top level | `listen` | `127.0.0.1:8080` | HTTP listen address |
-| | `retention_hours` | `24` | Drop jobs not updated for this long |
+| | `retention_hours` | `24` | Drop jobs not updated for this long (1 to 8784) |
 | `[github]` | `webhook_secret` | none | Turns on `POST /webhooks/github` |
 | | `token`, `repositories` | none | Poll these `owner/name` repositories; the token needs Actions read access |
 | | `poll_interval_secs` | `60` | At least 10 |
 | | `api_url` | `https://api.github.com` | GitHub Enterprise: `https://HOST/api/v3` |
 | `[circleci]` | `token`, `projects` | required | API token and `gh/org/repo`-style slugs |
 | | `poll_interval_secs` | `30` | At least 5 |
-| | `lookback_hours` | `6` | Pipelines created within this window are polled |
+| | `lookback_hours` | `6` | Pipelines created within this window are polled; workflows still held as active are refreshed after it |
 | `[[pools]]` | `name` plus conditions | none | First matching rule wins |
 
 A pool rule matches when every condition it sets matches:
@@ -127,11 +127,17 @@ Field names map to the OpenTelemetry CI/CD and VCS semantic conventions:
 
 - State is in memory. After a restart, webhook-only setups show jobs only
   from the next delivery, while polling refills queued and running jobs.
-- GitHub polling reads at most 100 runs per status and 100 jobs per run.
+- GitHub polling lists runs that are requested, pending, queued, waiting or
+  in progress, plus every run ciwatch still holds as active, and reads all
+  attempts of each run. It reads at most 100 runs per status and 100 jobs per
+  run. A run that returns 404 is dropped.
+- CircleCI's API gives no per-job queue time, so a CircleCI job's
+  `created_at` is when ciwatch first saw it. Jobs a finished workflow left
+  blocked or on hold are shown as `skipped`.
 - CircleCI's API does not say which executor or runner ran a job, so
   CircleCI pools come from repository and job-name rules.
 - Each CircleCI poll makes one request per recent pipeline plus one per
-  unfinished workflow. Size `lookback_hours` and `poll_interval_secs` for
+  unfinished workflow, and two per active workflow older than the lookback. Size `lookback_hours` and `poll_interval_secs` for
   your volume and rate limits.
 
 ## Development

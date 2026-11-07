@@ -1,15 +1,17 @@
 //! CircleCI: polls API v2, since CircleCI sends webhooks only for finished
 //! work.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
+use reqwest::StatusCode;
 use serde::Deserialize;
 
 use crate::config::CircleciConfig;
 use crate::model::{Job, PoolFacts, Provider, State};
+use crate::poll::{Failures, Source, fetch_json, status_of};
 use crate::pools::Pools;
 use crate::store::Store;
 
@@ -46,17 +48,24 @@ struct Workflow {
     id: String,
     name: String,
     status: String,
-    created_at: Option<DateTime<Utc>>,
+    pipeline_number: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CircleJob {
-    id: Option<String>,
     name: String,
     status: String,
     job_number: Option<u64>,
     started_at: Option<DateTime<Utc>>,
     stopped_at: Option<DateTime<Utc>>,
+}
+
+/// What a workflow's jobs inherit from their pipeline.
+struct RunContext<'a> {
+    slug: &'a str,
+    pipeline_number: Option<u64>,
+    branch: Option<String>,
+    revision: Option<String>,
 }
 
 fn job_state(status: &str) -> State {
@@ -119,48 +128,83 @@ impl Poller {
         }
     }
 
-    pub async fn run(self) {
-        let mut ticker = tokio::time::interval(self.config.interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            match self.poll_once().await {
-                Ok(()) => self.store.record_success(SOURCE, Utc::now()),
-                Err(e) => {
-                    tracing::warn!(error = format!("{e:#}"), "CircleCI poll failed");
-                    self.store.record_error(SOURCE, Utc::now(), format!("{e:#}"));
+    fn settled(&self) -> MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
+        self.settled.lock().expect("settled lock poisoned")
+    }
+
+    async fn poll_project(&self, slug: &str, since: DateTime<Utc>, seen: &mut HashSet<String>) -> Result<()> {
+        for pipeline in self.recent_pipelines(slug, since).await? {
+            let workflows: Vec<Workflow> = self
+                .get_all(&format!("/pipeline/{}/workflow", pipeline.id))
+                .await?;
+            let vcs = pipeline.vcs.unwrap_or_default();
+            for workflow in workflows {
+                seen.insert(workflow.id.clone());
+                if self.settled().contains_key(&workflow.id) {
+                    continue;
                 }
+                let context = RunContext {
+                    slug,
+                    pipeline_number: Some(pipeline.number),
+                    branch: vcs.branch.clone(),
+                    revision: vcs.revision.clone(),
+                };
+                self.refresh_workflow(&workflow, &context).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh workflows the store still holds as active but whose pipeline
+    /// has left the lookback window, such as a long approval hold.
+    async fn poll_held_workflows(&self, seen: &HashSet<String>, failures: &mut Failures) {
+        for template in self.store.active_runs(Provider::Circleci) {
+            if seen.contains(&template.run_id) {
+                continue;
+            }
+            let Some(slug) = self
+                .config
+                .projects
+                .iter()
+                .find(|s| repository_of(s).eq_ignore_ascii_case(&template.repository))
+            else {
+                continue;
+            };
+            let path = format!("/workflow/{}", template.run_id);
+            let workflow: Workflow = match self.get(&path, None).await {
+                Ok(w) => w,
+                Err(e) if status_of(&e) == Some(StatusCode::NOT_FOUND) => {
+                    self.store
+                        .remove_run(Provider::Circleci, &template.repository, &template.run_id);
+                    continue;
+                }
+                Err(e) => {
+                    failures.add(e);
+                    continue;
+                }
+            };
+            let context = RunContext {
+                slug,
+                pipeline_number: workflow.pipeline_number,
+                branch: template.branch.clone(),
+                revision: template.revision.clone(),
+            };
+            if let Err(e) = self.refresh_workflow(&workflow, &context).await {
+                failures.add(e);
             }
         }
     }
 
-    pub async fn poll_once(&self) -> Result<()> {
-        let now = Utc::now();
-        let since = now - self.config.lookback;
-        self.settled().retain(|_, at| *at >= since);
-        for slug in &self.config.projects {
-            for pipeline in self.recent_pipelines(slug, since).await? {
-                let workflows: Vec<Workflow> = self
-                    .get_all(&format!("/pipeline/{}/workflow", pipeline.id))
-                    .await?;
-                for workflow in workflows {
-                    if self.settled().contains_key(&workflow.id) {
-                        continue;
-                    }
-                    let jobs: Vec<CircleJob> =
-                        self.get_all(&format!("/workflow/{}/job", workflow.id)).await?;
-                    let mut all_finished = workflow_finished(&workflow.status);
-                    let observed = Utc::now();
-                    for job in jobs {
-                        let job = self.to_job(slug, &pipeline, &workflow, job, observed);
-                        all_finished &= !job.state.is_active();
-                        self.store.upsert(job);
-                    }
-                    if all_finished {
-                        self.settled().insert(workflow.id, observed);
-                    }
-                }
-            }
+    async fn refresh_workflow(&self, workflow: &Workflow, context: &RunContext<'_>) -> Result<()> {
+        let jobs: Vec<CircleJob> = self.get_all(&format!("/workflow/{}/job", workflow.id)).await?;
+        let finished = workflow_finished(&workflow.status);
+        let observed = Utc::now();
+        for job in jobs {
+            self.store
+                .upsert(self.to_job(context, workflow, job, finished, observed));
+        }
+        if finished {
+            self.settled().insert(workflow.id.clone(), observed);
         }
         Ok(())
     }
@@ -190,14 +234,19 @@ impl Poller {
 
     fn to_job(
         &self,
-        slug: &str,
-        pipeline: &Pipeline,
+        context: &RunContext<'_>,
         workflow: &Workflow,
         job: CircleJob,
+        workflow_finished: bool,
         now: DateTime<Utc>,
     ) -> Job {
-        let repository = repository_of(slug);
-        let state = job_state(&job.status);
+        let repository = repository_of(context.slug);
+        let mut state = job_state(&job.status);
+        // A finished workflow will never start the jobs it left blocked or
+        // on hold.
+        if workflow_finished && state.is_active() {
+            state = State::Skipped;
+        }
         let pool = self.pools.classify(&PoolFacts {
             provider: Provider::Circleci,
             repository: &repository,
@@ -206,43 +255,43 @@ impl Poller {
             runner: None,
             runner_group: None,
         });
-        let workflow_url = format!(
-            "{}/pipelines/{}/{}/workflows/{}",
-            self.config.app_url,
-            app_slug(slug),
-            pipeline.number,
-            workflow.id
-        );
-        let url = match job.job_number {
-            Some(n) => format!("{workflow_url}/jobs/{n}"),
-            None => workflow_url,
+        let workflow_url = context.pipeline_number.map(|n| {
+            format!(
+                "{}/pipelines/{}/{}/workflows/{}",
+                self.config.app_url,
+                app_slug(context.slug),
+                n,
+                workflow.id
+            )
+        });
+        let url = match (workflow_url, job.job_number) {
+            (Some(w), Some(n)) => Some(format!("{w}/jobs/{n}")),
+            (w, _) => w,
         };
-        let vcs = pipeline.vcs.as_ref();
         Job {
             provider: Provider::Circleci,
-            // Jobs that have not started yet may have no id.
-            id: job.id.unwrap_or_else(|| format!("{}/{}", workflow.id, job.name)),
+            // Job names are unique within a workflow, and unlike the job's
+            // own id this key exists before the job starts.
+            id: format!("{}/{}", workflow.id, job.name),
             repository,
             pipeline: workflow.name.clone(),
             run_id: workflow.id.clone(),
             name: job.name,
             state,
             provider_status: job.status,
-            branch: vcs.and_then(|v| v.branch.clone()),
-            revision: vcs.and_then(|v| v.revision.clone()),
+            branch: context.branch.clone(),
+            revision: context.revision.clone(),
             pool,
             runner: None,
             labels: Vec::new(),
-            url: Some(url),
-            created_at: workflow.created_at.or(Some(pipeline.created_at)),
+            url,
+            // The API gives no per-job queue time; the store keeps the time
+            // ciwatch first saw the job.
+            created_at: None,
             started_at: job.started_at,
             finished_at: job.stopped_at.filter(|_| !state.is_active()),
             observed_at: now,
         }
-    }
-
-    fn settled(&self) -> std::sync::MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
-        self.settled.lock().expect("settled lock poisoned")
     }
 
     async fn get_all<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
@@ -260,19 +309,42 @@ impl Poller {
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str, page_token: Option<&str>) -> Result<T> {
-        let url = format!("{}{path}", self.config.api_url);
-        let mut request = self.client.get(&url).header("Circle-Token", &self.config.token);
+        let mut request = self
+            .client
+            .get(format!("{}{path}", self.config.api_url))
+            .header("Circle-Token", &self.config.token);
         if let Some(token) = page_token {
             request = request.query(&[("page-token", token)]);
         }
-        request
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .with_context(|| format!("GET {path}"))?
-            .json()
-            .await
-            .with_context(|| format!("decoding {path}"))
+        fetch_json(request, path).await
+    }
+}
+
+impl Source for Poller {
+    fn name(&self) -> &'static str {
+        SOURCE
+    }
+
+    fn interval(&self) -> std::time::Duration {
+        self.config.interval
+    }
+
+    fn store(&self) -> &Store {
+        &self.store
+    }
+
+    async fn poll_once(&self) -> Result<()> {
+        let since = Utc::now() - self.config.lookback;
+        self.settled().retain(|_, at| *at >= since);
+        let mut failures = Failures::default();
+        let mut seen = HashSet::new();
+        for slug in &self.config.projects {
+            if let Err(e) = self.poll_project(slug, since, &mut seen).await {
+                failures.add(e.context(format!("project {slug}")));
+            }
+        }
+        self.poll_held_workflows(&seen, &mut failures).await;
+        failures.into_result()
     }
 }
 

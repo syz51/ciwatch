@@ -13,7 +13,8 @@ use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 
 use ciwatch::config::{CircleciConfig, GithubPoll};
-use ciwatch::model::{Provider, State as JobState};
+use ciwatch::model::{Job, Provider, State as JobState};
+use ciwatch::poll::Source;
 use ciwatch::pools::{PoolRule, Pools};
 use ciwatch::store::Store;
 use ciwatch::{circleci, github, http_client};
@@ -81,9 +82,52 @@ async fn circle_route(
             { "id": "j-done", "name": "fmt", "status": "success", "job_number": 9,
               "started_at": "2026-11-07T10:00:10Z", "stopped_at": "2026-11-07T10:00:40Z" },
         ], "next_page_token": null }),
+        // A workflow whose pipeline has left the lookback window.
+        "workflow/w-held" => json!({
+            "id": "w-held", "name": "release", "status": "failed", "pipeline_number": 30
+        }),
+        "workflow/w-held/job" => json!({ "items": [
+            { "name": "approve", "status": "on_hold", "started_at": null, "stopped_at": null },
+            { "name": "build", "status": "failed", "job_number": 7,
+              "started_at": "2026-11-01T10:00:00Z", "stopped_at": "2026-11-01T10:05:00Z" },
+        ], "next_page_token": null }),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     axum::Json(body).into_response()
+}
+
+fn circle_config(base: String) -> CircleciConfig {
+    CircleciConfig {
+        token: "cc-token".into(),
+        projects: vec!["gh/syz51/vps".into()],
+        interval: std::time::Duration::from_secs(30),
+        lookback: Duration::hours(6),
+        api_url: base,
+        app_url: "https://app.circleci.com".into(),
+    }
+}
+
+fn held_job(run_id: &str, name: &str) -> Job {
+    Job {
+        provider: Provider::Circleci,
+        id: format!("{run_id}/{name}"),
+        repository: "syz51/vps".into(),
+        pipeline: "release".into(),
+        run_id: run_id.into(),
+        name: name.into(),
+        state: JobState::Waiting,
+        provider_status: "on_hold".into(),
+        branch: Some("main".into()),
+        revision: Some("abc".into()),
+        pool: "circleci".into(),
+        runner: None,
+        labels: Vec::new(),
+        url: None,
+        created_at: None,
+        started_at: None,
+        finished_at: None,
+        observed_at: Utc::now(),
+    }
 }
 
 #[tokio::test]
@@ -181,6 +225,45 @@ async fn circleci_poll_maps_live_and_finished_jobs() {
 }
 
 #[tokio::test]
+async fn circleci_poll_refreshes_held_workflows_outside_the_lookback() {
+    let mock = CircleMock {
+        hits: Hits::default(),
+        pipelines_page1: json!({ "items": [], "next_page_token": null }),
+        pipelines_page2: json!({ "items": [], "next_page_token": null }),
+    };
+    let base = serve(
+        Router::new()
+            .route("/{*rest}", get(circle_route))
+            .with_state(mock),
+    )
+    .await;
+    let store = Arc::new(Store::new(Duration::hours(24 * 30)));
+    store.upsert(held_job("w-held", "approve"));
+    // The API no longer knows this workflow.
+    store.upsert(held_job("w-gone", "approve"));
+    let poller = circleci::Poller::new(
+        http_client().unwrap(),
+        circle_config(base),
+        store.clone(),
+        Arc::new(Pools::default()),
+    );
+    poller.poll_once().await.unwrap();
+
+    let jobs: HashMap<String, _> = store.snapshot().into_iter().map(|j| (j.id.clone(), j)).collect();
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    // The workflow failed, so its held approval will never run.
+    let approve = &jobs["w-held/approve"];
+    assert_eq!(approve.state, JobState::Skipped);
+    assert_eq!(approve.branch.as_deref(), Some("main"));
+    let build = &jobs["w-held/build"];
+    assert_eq!(build.state, JobState::Failure);
+    assert_eq!(
+        build.url.as_deref(),
+        Some("https://app.circleci.com/pipelines/github/syz51/vps/30/workflows/w-held/jobs/7")
+    );
+}
+
+#[tokio::test]
 async fn circleci_poll_reports_auth_failure() {
     let mock = CircleMock {
         hits: Hits::default(),
@@ -249,6 +332,9 @@ async fn github_poll_refreshes_listed_and_held_runs() {
                 move |Path(run): Path<u64>| async move {
                     hits.hit(&run.to_string());
                     calls.fetch_add(1, Ordering::SeqCst);
+                    if run == 33 {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
                     let jobs = match run {
                         55 => json!([gh_job(1, 55, "in_progress", None, Some("GitHub Actions 3"))]),
                         // The completion webhook for this run was missed.
@@ -261,7 +347,7 @@ async fn github_poll_refreshes_listed_and_held_runs() {
                         )]),
                         _ => json!([]),
                     };
-                    axum::Json(json!({ "total_count": 1, "jobs": jobs }))
+                    axum::Json(json!({ "total_count": 1, "jobs": jobs })).into_response()
                 }
             }),
         );
@@ -272,19 +358,24 @@ async fn github_poll_refreshes_listed_and_held_runs() {
     let stale: github::GhJob =
         serde_json::from_value(gh_job(2, 44, "in_progress", None, Some("GitHub Actions 9"))).unwrap();
     store.upsert(github::to_job(stale, "o/r", &pools, Utc::now()));
+    // A held run that has since been deleted.
+    let deleted: github::GhJob = serde_json::from_value(gh_job(3, 33, "queued", None, None)).unwrap();
+    store.upsert(github::to_job(deleted, "o/r", &pools, Utc::now()));
 
     let poller = github::Poller::new(
         http_client().unwrap(),
         GithubPoll {
             token: "gh-token".into(),
-            repositories: vec!["o/r".into()],
+            // The mock does not know o/missing; its failure must not stop o/r.
+            repositories: vec!["o/missing".into(), "o/r".into()],
             interval: std::time::Duration::from_secs(60),
             api_url: base,
         },
         store.clone(),
         pools,
     );
-    poller.poll_once().await.unwrap();
+    let err = format!("{:#}", poller.poll_once().await.unwrap_err());
+    assert!(err.contains("o/missing"), "{err}");
 
     assert_eq!(hits.get("55"), 1);
     assert_eq!(hits.get("44"), 1);
@@ -292,5 +383,6 @@ async fn github_poll_refreshes_listed_and_held_runs() {
     assert_eq!(jobs["1"].state, JobState::Running);
     assert_eq!(jobs["1"].pool, "github-hosted");
     assert_eq!(jobs["2"].state, JobState::Failure);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!jobs.contains_key("3"), "{jobs:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }

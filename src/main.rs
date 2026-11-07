@@ -52,13 +52,13 @@ async fn main() -> Result<()> {
         if let Some(poll) = &gh.poll {
             store.register_source(github::SOURCE_POLL);
             let poller = github::Poller::new(client.clone(), poll.clone(), store.clone(), pools.clone());
-            tasks.spawn(poller.run());
+            tasks.spawn(ciwatch::poll::run(poller));
         }
     }
     if let Some(cc) = &config.circleci {
         store.register_source(circleci::SOURCE);
         let poller = circleci::Poller::new(client.clone(), cc.clone(), store.clone(), pools.clone());
-        tasks.spawn(poller.run());
+        tasks.spawn(ciwatch::poll::run(poller));
     }
     let pruner = store.clone();
     tasks.spawn(async move {
