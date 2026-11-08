@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
@@ -21,6 +21,10 @@ pub const SOURCE: &str = "circleci-poll";
 const MAX_PIPELINE_PAGES: usize = 5;
 /// Pages of workflows or jobs read per parent, at most.
 const MAX_CHILD_PAGES: usize = 10;
+/// How long after a pipeline is created a 404 for its workflows means they
+/// do not exist yet. CircleCI creates an API-triggered pipeline before its
+/// workflows; after this grace the 404 is an error.
+const NEW_PIPELINE_GRACE: Duration = Duration::minutes(5);
 
 #[derive(Debug, Deserialize)]
 struct Page<T> {
@@ -132,25 +136,50 @@ impl Poller {
         self.settled.lock().expect("settled lock poisoned")
     }
 
-    async fn poll_project(&self, slug: &str, since: DateTime<Utc>, seen: &mut HashSet<String>) -> Result<()> {
+    /// Refresh one project's recent pipelines. A failed pipeline is recorded
+    /// in `failures` and does not stop the others.
+    async fn poll_project(
+        &self,
+        slug: &str,
+        since: DateTime<Utc>,
+        seen: &mut HashSet<String>,
+        failures: &mut Failures,
+    ) -> Result<()> {
         for pipeline in self.recent_pipelines(slug, since).await? {
-            let workflows: Vec<Workflow> = self
-                .get_all(&format!("/pipeline/{}/workflow", pipeline.id))
-                .await?;
-            let vcs = pipeline.vcs.unwrap_or_default();
-            for workflow in workflows {
-                seen.insert(workflow.id.clone());
-                if self.settled().contains_key(&workflow.id) {
-                    continue;
-                }
-                let context = RunContext {
-                    slug,
-                    pipeline_number: Some(pipeline.number),
-                    branch: vcs.branch.clone(),
-                    revision: vcs.revision.clone(),
-                };
-                self.refresh_workflow(&workflow, &context).await?;
+            let label = format!("project {slug} pipeline {} ({})", pipeline.number, pipeline.id);
+            if let Err(e) = self.poll_pipeline(slug, pipeline, seen).await {
+                failures.add(e.context(label));
             }
+        }
+        Ok(())
+    }
+
+    async fn poll_pipeline(&self, slug: &str, pipeline: Pipeline, seen: &mut HashSet<String>) -> Result<()> {
+        let workflows: Vec<Workflow> =
+            match self.get_all(&format!("/pipeline/{}/workflow", pipeline.id)).await {
+                Ok(w) => w,
+                Err(e)
+                    if status_of(&e) == Some(StatusCode::NOT_FOUND)
+                        && Utc::now() - pipeline.created_at < NEW_PIPELINE_GRACE =>
+                {
+                    tracing::debug!(slug, pipeline = %pipeline.id, "new pipeline has no workflows yet");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+        let vcs = pipeline.vcs.unwrap_or_default();
+        for workflow in workflows {
+            seen.insert(workflow.id.clone());
+            if self.settled().contains_key(&workflow.id) {
+                continue;
+            }
+            let context = RunContext {
+                slug,
+                pipeline_number: Some(pipeline.number),
+                branch: vcs.branch.clone(),
+                revision: vcs.revision.clone(),
+            };
+            self.refresh_workflow(&workflow, &context).await?;
         }
         Ok(())
     }
@@ -339,7 +368,7 @@ impl Source for Poller {
         let mut failures = Failures::default();
         let mut seen = HashSet::new();
         for slug in &self.config.projects {
-            if let Err(e) = self.poll_project(slug, since, &mut seen).await {
+            if let Err(e) = self.poll_project(slug, since, &mut seen, &mut failures).await {
                 failures.add(e.context(format!("project {slug}")));
             }
         }

@@ -293,6 +293,62 @@ async fn circleci_poll_reports_auth_failure() {
     assert!(err.contains("401"), "{err}");
 }
 
+/// Serve page 1 of pipelines: one whose workflows return 404, created
+/// `age` ago, then the known pipeline p1.
+async fn circle_with_missing_workflows(age: Duration) -> (circleci::Poller, Arc<Store>, Hits) {
+    let now = Utc::now();
+    let mock = CircleMock {
+        hits: Hits::default(),
+        pipelines_page1: json!({ "items": [
+            { "id": "p-404", "number": 43, "state": "created",
+              "created_at": (now - age).to_rfc3339(),
+              "vcs": { "branch": "main", "revision": "def456" } },
+            { "id": "p1", "number": 42, "state": "created",
+              "created_at": (now - Duration::minutes(10)).to_rfc3339(),
+              "vcs": { "branch": "feature", "revision": "abc123def" } },
+        ], "next_page_token": null }),
+        pipelines_page2: json!({ "items": [], "next_page_token": null }),
+    };
+    let hits = mock.hits.clone();
+    let base = serve(
+        Router::new()
+            .route("/{*rest}", get(circle_route))
+            .with_state(mock),
+    )
+    .await;
+    let store = Arc::new(Store::new(Duration::hours(24)));
+    let poller = circleci::Poller::new(
+        http_client().unwrap(),
+        circle_config(base),
+        store.clone(),
+        Arc::new(Pools::default()),
+    );
+    (poller, store, hits)
+}
+
+#[tokio::test]
+async fn circleci_poll_skips_workflow_404_of_a_new_pipeline() {
+    let (poller, store, hits) = circle_with_missing_workflows(Duration::seconds(20)).await;
+    poller.poll_once().await.unwrap();
+    assert_eq!(hits.get("pipeline/p-404/workflow"), 1);
+    // The pipeline after it is still polled.
+    let names: Vec<String> = store.snapshot().into_iter().map(|j| j.name).collect();
+    assert_eq!(names.len(), 4, "{names:?}");
+    assert!(names.iter().any(|n| n == "rust-controllers"), "{names:?}");
+}
+
+#[tokio::test]
+async fn circleci_poll_reports_workflow_404_after_the_grace() {
+    let (poller, store, hits) = circle_with_missing_workflows(Duration::minutes(30)).await;
+    let err = format!("{:#}", poller.poll_once().await.unwrap_err());
+    assert!(err.contains("pipeline 43 (p-404)"), "{err}");
+    assert!(err.contains("404"), "{err}");
+    assert_eq!(hits.get("pipeline/p-404/workflow"), 1);
+    // The failed pipeline does not stop the one after it.
+    assert_eq!(hits.get("pipeline/p1/workflow"), 1);
+    assert_eq!(store.snapshot().len(), 4);
+}
+
 fn gh_job(id: u64, run: u64, status: &str, conclusion: Option<&str>, runner: Option<&str>) -> Value {
     json!({
         "id": id, "run_id": run, "name": format!("job-{id}"), "workflow_name": "CI",

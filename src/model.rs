@@ -27,7 +27,7 @@ pub enum State {
     /// Waiting for a runner or executor.
     Queued,
     /// Held by something other than capacity: an approval, an environment
-    /// protection rule or an upstream job.
+    /// protection rule, a concurrency group or an upstream job.
     Waiting,
     Running,
     Success,

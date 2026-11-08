@@ -92,8 +92,10 @@ job up.
 | `ciwatch_source_errors_total` (counter) | `source` |
 | `ciwatch_webhook_deliveries_total` (counter) | `result`: `accepted`, `ignored`, `rejected` |
 
-States are `queued`, `waiting` (approval, environment protection or a blocked
-upstream job), `running`, `success`, `failure`, `cancelled` and `skipped`.
+States are `queued`, `waiting` (approval, environment protection, a
+concurrency group or a blocked upstream job), `running`, `success`,
+`failure`, `cancelled` and `skipped`. Only `queued` jobs count toward
+`ciwatch_oldest_queued_job_age_seconds`.
 Each job also keeps the provider's own status word.
 
 ### Job model
@@ -123,7 +125,7 @@ docker run --read-only -p 127.0.0.1:8080:8080 \
   -e CIWATCH_GITHUB_WEBHOOK_SECRET -e CIWATCH_GITHUB_TOKEN \
   -v "$PWD/ciwatch.toml:/etc/ciwatch/ciwatch.toml:ro" \
   -v "$PWD/circleci-token:/etc/ciwatch/circleci-token:ro" \
-  ghcr.io/syz51/ciwatch:v0.1.1
+  ghcr.io/syz51/ciwatch:v0.1.2
 ```
 
 Set `listen = "0.0.0.0:8080"` in that file so the published port reaches it.
@@ -163,6 +165,10 @@ Verify an image with `gh attestation verify oci://ghcr.io/syz51/ciwatch:<tag> -R
 - CircleCI's API gives no per-job queue time, so a CircleCI job's
   `created_at` is when ciwatch first saw it. Jobs a finished workflow left
   blocked or on hold are shown as `skipped`.
+- CircleCI creates an API-triggered pipeline before its workflows and
+  answers 404 for them until they exist. ciwatch skips such a pipeline for
+  5 minutes after it is created; a later 404 is an error. A pipeline that
+  fails is reported without stopping the project's other pipelines.
 - CircleCI's API does not say which executor or runner ran a job, so
   CircleCI pools come from repository and job-name rules.
 - Each CircleCI poll makes one request per recent pipeline plus one per
