@@ -66,8 +66,10 @@ pub struct GhJob {
 
 fn state_of(status: &str, conclusion: Option<&str>) -> State {
     match status {
-        "queued" | "requested" | "pending" => State::Queued,
-        "waiting" => State::Waiting,
+        "queued" | "requested" => State::Queued,
+        // `pending` is a job held by a concurrency group, not one waiting
+        // for a runner.
+        "waiting" | "pending" => State::Waiting,
         "in_progress" => State::Running,
         _ => match conclusion {
             Some("success" | "neutral") => State::Success,
@@ -249,6 +251,7 @@ mod tests {
     fn maps_states() {
         assert_eq!(state_of("queued", None), State::Queued);
         assert_eq!(state_of("waiting", None), State::Waiting);
+        assert_eq!(state_of("pending", None), State::Waiting);
         assert_eq!(state_of("in_progress", None), State::Running);
         assert_eq!(state_of("completed", Some("success")), State::Success);
         assert_eq!(state_of("completed", Some("timed_out")), State::Failure);
@@ -271,5 +274,30 @@ mod tests {
         assert_eq!(job.started_at, None);
         assert_eq!(job.runner, None);
         assert_eq!(job.pool, "unassigned");
+    }
+
+    #[test]
+    fn concurrency_pending_job_waits_and_stays_visible() {
+        let job: GhJob = serde_json::from_value(serde_json::json!({
+            "id": 8, "run_id": 4, "name": "deploy", "workflow_name": "CD",
+            "head_branch": "main", "head_sha": "abc", "status": "pending", "conclusion": null,
+            "created_at": "2026-11-07T10:00:00Z", "started_at": "2026-11-07T10:00:00Z",
+            "completed_at": null, "html_url": "https://github.com/o/r/actions/runs/4/job/8",
+            "labels": ["ubuntu-latest"], "runner_name": "", "runner_group_name": ""
+        }))
+        .unwrap();
+        let now = "2026-11-08T10:00:00Z".parse().unwrap();
+        let job = to_job(job, "o/r", &Pools::default(), now);
+        assert_eq!(job.state, State::Waiting);
+        assert!(job.state.is_active());
+        assert_eq!(job.provider_status, "pending");
+        let text = crate::metrics::render(&[job], &Default::default(), None, now);
+        assert!(
+            text.contains(
+                r#"ciwatch_jobs{provider="github",pool="unassigned",repository="o/r",state="waiting"} 1"#
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("ciwatch_oldest_queued_job_age_seconds{"), "{text}");
     }
 }
