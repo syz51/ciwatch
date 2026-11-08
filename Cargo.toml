@@ -1,6 +1,6 @@
 [package]
 name = "ciwatch"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 description = "One live view of CI jobs across GitHub Actions, CircleCI and self-hosted runner pools"
