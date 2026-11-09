@@ -21,7 +21,7 @@ impl Provider {
 
 /// Where a job is in its life. Providers' own status words are kept in
 /// [`Job::provider_status`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     /// Waiting for a runner or executor.
@@ -81,8 +81,9 @@ pub struct JobKey {
     pub id: String,
 }
 
-/// One job (OpenTelemetry: a pipeline task run) on any provider.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// One job (OpenTelemetry: a pipeline task run) on any provider. The state
+/// file stores it in the same shape as `/api/jobs`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub provider: Provider,
     /// Provider-unique job id.

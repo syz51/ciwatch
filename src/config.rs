@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
+use crate::model::{Job, Provider};
 use crate::pools::PoolRule;
 
 /// Where a secret comes from. Values never appear in the file itself.
@@ -42,6 +43,7 @@ struct RawConfig {
     listen: SocketAddr,
     #[serde(default = "default_retention_hours")]
     retention_hours: u64,
+    state_file: Option<PathBuf>,
     github: Option<RawGithub>,
     circleci: Option<RawCircleci>,
     #[serde(default)]
@@ -106,6 +108,9 @@ fn default_circleci_app() -> String {
 pub struct Config {
     pub listen: SocketAddr,
     pub retention: chrono::Duration,
+    /// Where jobs are saved across restarts, resolved against the config
+    /// file's directory.
+    pub state_file: Option<PathBuf>,
     pub github: Option<GithubConfig>,
     pub circleci: Option<CircleciConfig>,
     pub pools: Vec<PoolRule>,
@@ -140,6 +145,27 @@ pub struct CircleciConfig {
 }
 
 impl Config {
+    /// Whether a poller refreshes `job`'s run, so a restored active job will
+    /// be updated: its repository or project is polled.
+    pub fn polls(&self, job: &Job) -> bool {
+        match job.provider {
+            Provider::Github => self
+                .github
+                .as_ref()
+                .and_then(|g| g.poll.as_ref())
+                .is_some_and(|p| {
+                    p.repositories
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&job.repository))
+                }),
+            Provider::Circleci => self.circleci.as_ref().is_some_and(|c| {
+                c.projects
+                    .iter()
+                    .any(|s| crate::circleci::repository_of(s).eq_ignore_ascii_case(&job.repository))
+            }),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading config {}", path.display()))?;
@@ -151,6 +177,14 @@ impl Config {
     pub fn parse(text: &str, base: &Path) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text).context("parsing config")?;
         let retention = hours("retention_hours", raw.retention_hours)?;
+        if let Some(path) = &raw.state_file {
+            let last = path.as_os_str().as_encoded_bytes().rsplit(|b| *b == b'/').next();
+            ensure!(
+                !matches!(last, None | Some(b"" | b"." | b"..")),
+                "state_file {} does not name a file",
+                path.display()
+            );
+        }
 
         let github = raw
             .github
@@ -247,6 +281,7 @@ impl Config {
         Ok(Config {
             listen: raw.listen,
             retention,
+            state_file: raw.state_file.map(|p| base.join(p)),
             github,
             circleci,
             pools: raw.pools,
@@ -341,6 +376,58 @@ mod tests {
         assert_eq!(github.poll.unwrap().repositories, ["syz51/vps"]);
         assert_eq!(config.circleci.unwrap().projects, ["gh/syz51/vps"]);
         assert_eq!(config.pools.len(), 1);
+        assert_eq!(config.state_file, None);
+    }
+
+    #[test]
+    fn polls_only_configured_repositories() {
+        let dir = SecretDir::new("polls");
+        let config = Config::parse(
+            r#"
+            [github]
+            webhook_secret = { file = "secret" }
+            token = { file = "secret" }
+            repositories = ["syz51/vps"]
+            [circleci]
+            token = { file = "secret" }
+            projects = ["gh/syz51/email-agent"]
+            "#,
+            &dir.0,
+        )
+        .unwrap();
+        let t = chrono::Utc::now();
+        let mut job = crate::store::tests::job("1", crate::model::State::Queued, t);
+        for (provider, repository, polled) in [
+            (Provider::Github, "Syz51/VPS", true),
+            (Provider::Github, "syz51/email-agent", false),
+            (Provider::Circleci, "syz51/email-agent", true),
+            (Provider::Circleci, "syz51/vps", false),
+        ] {
+            job.provider = provider;
+            job.repository = repository.into();
+            assert_eq!(config.polls(&job), polled, "{provider:?} {repository}");
+        }
+        let webhook_only = Config::parse("[github]\nwebhook_secret = { file = \"secret\" }", &dir.0).unwrap();
+        job.provider = Provider::Github;
+        job.repository = "syz51/vps".into();
+        assert!(!webhook_only.polls(&job));
+    }
+
+    #[test]
+    fn resolves_the_state_file() {
+        let dir = SecretDir::new("state-file");
+        for (value, expected) in [
+            (
+                "/var/lib/ciwatch/state.json",
+                PathBuf::from("/var/lib/ciwatch/state.json"),
+            ),
+            ("state.json", dir.0.join("state.json")),
+        ] {
+            let text =
+                format!("state_file = \"{value}\"\n[github]\nwebhook_secret = {{ file = \"secret\" }}");
+            let config = Config::parse(&text, &dir.0).unwrap_or_else(|e| panic!("{text:?}: {e:#}"));
+            assert_eq!(config.state_file, Some(expected));
+        }
     }
 
     #[test]
@@ -361,6 +448,18 @@ mod tests {
                 "http or https",
             ),
             ("", "at least one"),
+            (
+                "state_file = \"/var/lib/ciwatch/\"\n[github]\nwebhook_secret = { file = \"secret\" }",
+                "does not name a file",
+            ),
+            (
+                "state_file = \"..\"\n[github]\nwebhook_secret = { file = \"secret\" }",
+                "does not name a file",
+            ),
+            (
+                "state_file = \"/var/lib/ciwatch/.\"\n[github]\nwebhook_secret = { file = \"secret\" }",
+                "does not name a file",
+            ),
             ("[github]\nrepositories = [\"a/b\"]", "needs github.token"),
             (
                 "[github]\nwebhook_secret = { file = \"secret\" }\nunknown = 1",

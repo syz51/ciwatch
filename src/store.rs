@@ -1,6 +1,8 @@
-//! In-memory job store and source health.
+//! In-memory job store and source health. [`crate::state_file`] can save
+//! the jobs and restore them at start.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use chrono::{DateTime, Duration, Utc};
@@ -35,6 +37,8 @@ pub struct Store {
     sources: Mutex<BTreeMap<String, SourceHealth>>,
     webhooks: Mutex<WebhookCounts>,
     retention: Duration,
+    /// Counts changes to `jobs`, so a saver can tell whether to write.
+    changes: AtomicU64,
 }
 
 impl Store {
@@ -44,7 +48,35 @@ impl Store {
             sources: Mutex::new(BTreeMap::new()),
             webhooks: Mutex::new(WebhookCounts::default()),
             retention,
+            changes: AtomicU64::new(0),
         }
+    }
+
+    /// A number that grows whenever a job is added, removed or changed in
+    /// more than `observed_at`.
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Acquire)
+    }
+
+    fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Add jobs saved by an earlier run, then drop those older than the
+    /// retention window. An active job is added only when `refreshed` says a
+    /// poller will update it; otherwise nothing would ever finish it. A job
+    /// already held is kept as it is.
+    pub fn restore(&self, saved: Vec<Job>, now: DateTime<Utc>, refreshed: impl Fn(&Job) -> bool) {
+        {
+            let mut jobs = self.jobs.write().expect("job store lock poisoned");
+            for job in saved {
+                if !job.state.is_active() || refreshed(&job) {
+                    jobs.entry(job.key()).or_insert(job);
+                }
+            }
+        }
+        self.changed();
+        self.prune(now);
     }
 
     /// Insert or update a job. A job never moves back to an earlier state; a
@@ -55,6 +87,7 @@ impl Store {
         match jobs.get_mut(&job.key()) {
             Some(existing) if existing.state.progress() > job.state.progress() => {
                 existing.observed_at = existing.observed_at.max(job.observed_at);
+                return;
             }
             Some(existing) => {
                 job.created_at = existing.created_at.or(job.created_at);
@@ -62,16 +95,26 @@ impl Store {
                 if job.runner.is_none() && existing.runner.is_some() {
                     // The pool was classified with the runner known; an
                     // update without it cannot classify better.
-                    job.runner = existing.runner.take();
-                    job.pool = std::mem::take(&mut existing.pool);
+                    job.runner = existing.runner.clone();
+                    job.pool = existing.pool.clone();
                 }
+                let observed_only = Job {
+                    observed_at: existing.observed_at,
+                    ..job.clone()
+                } == *existing;
                 *existing = job;
+                if observed_only {
+                    // A poll that only saw the job again is not worth a save.
+                    return;
+                }
             }
             None => {
                 job.created_at = job.created_at.or(Some(job.observed_at));
                 jobs.insert(job.key(), job);
             }
         }
+        drop(jobs);
+        self.changed();
     }
 
     /// Run ids of jobs from `provider` and `repository` (compared without
@@ -99,14 +142,33 @@ impl Store {
 
     /// Forget every job of one run.
     pub fn remove_run(&self, provider: Provider, repository: &str, run_id: &str) {
+        let mut jobs = self.jobs.write().expect("job store lock poisoned");
+        let before = jobs.len();
+        jobs.retain(|_, j| {
+            !(j.provider == provider && j.repository.eq_ignore_ascii_case(repository) && j.run_id == run_id)
+        });
+        if jobs.len() != before {
+            drop(jobs);
+            self.changed();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.read().expect("job store lock poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every job, in no particular order.
+    pub fn jobs(&self) -> Vec<Job> {
         self.jobs
-            .write()
+            .read()
             .expect("job store lock poisoned")
-            .retain(|_, j| {
-                !(j.provider == provider
-                    && j.repository.eq_ignore_ascii_case(repository)
-                    && j.run_id == run_id)
-            });
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Active jobs first, oldest first; then finished jobs, newest first.
@@ -137,10 +199,13 @@ impl Store {
     /// Drop jobs not seen within the retention window.
     pub fn prune(&self, now: DateTime<Utc>) {
         let cutoff = now - self.retention;
-        self.jobs
-            .write()
-            .expect("job store lock poisoned")
-            .retain(|_, j| j.observed_at >= cutoff);
+        let mut jobs = self.jobs.write().expect("job store lock poisoned");
+        let before = jobs.len();
+        jobs.retain(|_, j| j.observed_at >= cutoff);
+        if jobs.len() != before {
+            drop(jobs);
+            self.changed();
+        }
     }
 
     pub fn record_success(&self, source: &str, at: DateTime<Utc>) {
@@ -246,6 +311,52 @@ pub(crate) mod tests {
         store.prune(t);
         let ids: Vec<_> = store.snapshot().into_iter().map(|j| j.id).collect();
         assert_eq!(ids, ["new"]);
+    }
+
+    #[test]
+    fn restore_prunes_and_keeps_held_jobs() {
+        let store = Store::new(Duration::hours(1));
+        let t = Utc::now();
+        store.upsert(job("held", State::Running, t));
+        let before = store.changes();
+        store.restore(
+            vec![
+                job("old", State::Success, t - Duration::hours(2)),
+                job("kept", State::Failure, t - Duration::minutes(30)),
+                job("held", State::Success, t - Duration::minutes(30)),
+            ],
+            t,
+            |_| true,
+        );
+        assert!(store.changes() > before);
+        let mut jobs = store.snapshot();
+        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<_> = jobs.iter().map(|j| (j.id.as_str(), j.state)).collect();
+        assert_eq!(ids, [("held", State::Running), ("kept", State::Failure)]);
+    }
+
+    #[test]
+    fn changes_count_only_real_changes() {
+        let store = Store::new(Duration::hours(1));
+        let t = Utc::now();
+        let start = store.changes();
+        store.prune(t);
+        store.remove_run(Provider::Github, "o/r", "1");
+        assert_eq!(store.changes(), start);
+        store.upsert(job("1", State::Queued, t));
+        let after_upsert = store.changes();
+        assert!(after_upsert > start);
+        // Seen again, or a late update: only observed_at moves.
+        store.upsert(job("1", State::Queued, t + Duration::seconds(30)));
+        assert_eq!(store.changes(), after_upsert);
+        store.upsert(job("1", State::Running, t + Duration::seconds(60)));
+        let after_start = store.changes();
+        assert!(after_start > after_upsert);
+        store.upsert(job("1", State::Queued, t + Duration::seconds(90)));
+        assert_eq!(store.changes(), after_start);
+        assert_eq!(store.jobs()[0].observed_at, t + Duration::seconds(90));
+        store.remove_run(Provider::Github, "O/R", "1");
+        assert!(store.changes() > after_start);
     }
 
     #[test]

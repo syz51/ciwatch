@@ -9,6 +9,7 @@ pub mod model;
 pub mod poll;
 pub mod pools;
 pub mod server;
+pub mod state_file;
 pub mod store;
 pub mod web;
 

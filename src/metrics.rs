@@ -70,7 +70,7 @@ pub fn render(
         );
     }
 
-    out.push_str("# HELP ciwatch_source_last_success_timestamp_seconds When each source last polled or delivered successfully.\n");
+    out.push_str("# HELP ciwatch_source_last_success_timestamp_seconds When each source last polled, delivered, loaded or saved successfully.\n");
     out.push_str("# TYPE ciwatch_source_last_success_timestamp_seconds gauge\n");
     for (name, health) in sources {
         if let Some(at) = health.last_success {
@@ -82,7 +82,7 @@ pub fn render(
             );
         }
     }
-    out.push_str("# HELP ciwatch_source_errors_total Failed polls per source.\n");
+    out.push_str("# HELP ciwatch_source_errors_total Failed polls, loads and saves per source.\n");
     out.push_str("# TYPE ciwatch_source_errors_total counter\n");
     for (name, health) in sources {
         let _ = writeln!(
