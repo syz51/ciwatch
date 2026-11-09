@@ -16,7 +16,8 @@ Prometheus metrics.
   names, runner groups, repositories and job names.
 
 ciwatch is a single binary that holds no database: jobs live in memory for
-a retention window (24 hours by default).
+a retention window (24 hours by default). An optional state file keeps them
+across restarts.
 
 ## Quick start
 
@@ -44,6 +45,7 @@ keys are rejected.
 | --- | --- | --- | --- |
 | top level | `listen` | `127.0.0.1:8080` | HTTP listen address |
 | | `retention_hours` | `24` | Drop jobs not updated for this long (1 to 8784) |
+| | `state_file` | none | Save jobs to this file and restore them at start; relative to the config file |
 | `[github]` | `webhook_secret` | none | Turns on `POST /webhooks/github` |
 | | `webhook_listen` | none | Serve the webhook only on this address, and not on `listen` |
 | | `token`, `repositories` | none | Poll these `owner/name` repositories; the token needs Actions read access |
@@ -71,6 +73,21 @@ Jobs that match no rule fall into these defaults:
 
 Label rules classify queued jobs; runner rules apply once a runner picks a
 job up.
+
+## State file
+
+With `state_file` set, ciwatch restores the saved jobs at start and drops
+those older than the retention window. It saves the jobs every 30 seconds
+when they changed, and once more on shutdown. Each save writes a temporary
+file (`<state_file>.tmp`, mode 0600) next to the file, flushes it to disk,
+renames it over the file and flushes the directory, so a crash leaves the
+old file or the new one. The directory must be writable.
+
+A file that cannot be read or decoded is logged as an error and ciwatch
+starts empty; it never stops the server. The next save replaces it. Load
+and save outcomes appear as the `state-file` source in `/api/jobs` and in
+the source metrics. The file holds what `/api/jobs` shows, so protect it the
+same way.
 
 ## Endpoints
 
@@ -125,10 +142,13 @@ docker run --read-only -p 127.0.0.1:8080:8080 \
   -e CIWATCH_GITHUB_WEBHOOK_SECRET -e CIWATCH_GITHUB_TOKEN \
   -v "$PWD/ciwatch.toml:/etc/ciwatch/ciwatch.toml:ro" \
   -v "$PWD/circleci-token:/etc/ciwatch/circleci-token:ro" \
-  ghcr.io/syz51/ciwatch:v0.1.2
+  ghcr.io/syz51/ciwatch:v0.1.3
 ```
 
 Set `listen = "0.0.0.0:8080"` in that file so the published port reaches it.
+For a `state_file`, mount a directory the image's user (65532) can write,
+such as `-v "$PWD/state:/var/lib/ciwatch"`, and set
+`state_file = "/var/lib/ciwatch/state.json"`.
 The example passes the secrets that `ciwatch.example.toml` names, since a
 secret file resolves next to the config file. With `webhook_listen`, also
 publish its port.
@@ -156,8 +176,11 @@ Verify an image with `gh attestation verify oci://ghcr.io/syz51/ciwatch:<tag> -R
 
 ## Limits
 
-- State is in memory. After a restart, webhook-only setups show jobs only
-  from the next delivery, while polling refills queued and running jobs.
+- Without `state_file`, state is in memory only. After a restart,
+  webhook-only setups show jobs only from the next delivery, while polling
+  refills queued and running jobs. With it, a restart loses at most the last
+  30 seconds of changes when ciwatch is killed without a clean shutdown;
+  polling repairs active jobs, but webhook deliveries in that window are lost.
 - GitHub polling lists runs that are requested, pending, queued, waiting or
   in progress, plus every run ciwatch still holds as active, and reads all
   attempts of each run. It reads at most 100 runs per status and 100 jobs per

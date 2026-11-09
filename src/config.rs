@@ -42,6 +42,7 @@ struct RawConfig {
     listen: SocketAddr,
     #[serde(default = "default_retention_hours")]
     retention_hours: u64,
+    state_file: Option<PathBuf>,
     github: Option<RawGithub>,
     circleci: Option<RawCircleci>,
     #[serde(default)]
@@ -106,6 +107,9 @@ fn default_circleci_app() -> String {
 pub struct Config {
     pub listen: SocketAddr,
     pub retention: chrono::Duration,
+    /// Where jobs are saved across restarts, resolved against the config
+    /// file's directory.
+    pub state_file: Option<PathBuf>,
     pub github: Option<GithubConfig>,
     pub circleci: Option<CircleciConfig>,
     pub pools: Vec<PoolRule>,
@@ -151,6 +155,13 @@ impl Config {
     pub fn parse(text: &str, base: &Path) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text).context("parsing config")?;
         let retention = hours("retention_hours", raw.retention_hours)?;
+        if let Some(path) = &raw.state_file {
+            ensure!(
+                path.file_name().is_some() && !path.as_os_str().as_encoded_bytes().ends_with(b"/"),
+                "state_file {} does not name a file",
+                path.display()
+            );
+        }
 
         let github = raw
             .github
@@ -247,6 +258,7 @@ impl Config {
         Ok(Config {
             listen: raw.listen,
             retention,
+            state_file: raw.state_file.map(|p| base.join(p)),
             github,
             circleci,
             pools: raw.pools,
@@ -341,6 +353,24 @@ mod tests {
         assert_eq!(github.poll.unwrap().repositories, ["syz51/vps"]);
         assert_eq!(config.circleci.unwrap().projects, ["gh/syz51/vps"]);
         assert_eq!(config.pools.len(), 1);
+        assert_eq!(config.state_file, None);
+    }
+
+    #[test]
+    fn resolves_the_state_file() {
+        let dir = SecretDir::new("state-file");
+        for (value, expected) in [
+            (
+                "/var/lib/ciwatch/state.json",
+                PathBuf::from("/var/lib/ciwatch/state.json"),
+            ),
+            ("state.json", dir.0.join("state.json")),
+        ] {
+            let text =
+                format!("state_file = \"{value}\"\n[github]\nwebhook_secret = {{ file = \"secret\" }}");
+            let config = Config::parse(&text, &dir.0).unwrap_or_else(|e| panic!("{text:?}: {e:#}"));
+            assert_eq!(config.state_file, Some(expected));
+        }
     }
 
     #[test]
@@ -361,6 +391,14 @@ mod tests {
                 "http or https",
             ),
             ("", "at least one"),
+            (
+                "state_file = \"/var/lib/ciwatch/\"\n[github]\nwebhook_secret = { file = \"secret\" }",
+                "does not name a file",
+            ),
+            (
+                "state_file = \"..\"\n[github]\nwebhook_secret = { file = \"secret\" }",
+                "does not name a file",
+            ),
             ("[github]\nrepositories = [\"a/b\"]", "needs github.token"),
             (
                 "[github]\nwebhook_secret = { file = \"secret\" }\nunknown = 1",

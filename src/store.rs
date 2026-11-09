@@ -1,6 +1,8 @@
-//! In-memory job store and source health.
+//! In-memory job store and source health. [`crate::state_file`] can save
+//! the jobs and restore them at start.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use chrono::{DateTime, Duration, Utc};
@@ -35,6 +37,8 @@ pub struct Store {
     sources: Mutex<BTreeMap<String, SourceHealth>>,
     webhooks: Mutex<WebhookCounts>,
     retention: Duration,
+    /// Counts changes to `jobs`, so a saver can tell whether to write.
+    changes: AtomicU64,
 }
 
 impl Store {
@@ -44,7 +48,30 @@ impl Store {
             sources: Mutex::new(BTreeMap::new()),
             webhooks: Mutex::new(WebhookCounts::default()),
             retention,
+            changes: AtomicU64::new(0),
         }
+    }
+
+    /// A number that grows whenever the jobs change.
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Acquire)
+    }
+
+    fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Add jobs saved by an earlier run, then drop those older than the
+    /// retention window. A job already held is kept as it is.
+    pub fn restore(&self, saved: Vec<Job>, now: DateTime<Utc>) {
+        {
+            let mut jobs = self.jobs.write().expect("job store lock poisoned");
+            for job in saved {
+                jobs.entry(job.key()).or_insert(job);
+            }
+        }
+        self.changed();
+        self.prune(now);
     }
 
     /// Insert or update a job. A job never moves back to an earlier state; a
@@ -72,6 +99,8 @@ impl Store {
                 jobs.insert(job.key(), job);
             }
         }
+        drop(jobs);
+        self.changed();
     }
 
     /// Run ids of jobs from `provider` and `repository` (compared without
@@ -99,14 +128,15 @@ impl Store {
 
     /// Forget every job of one run.
     pub fn remove_run(&self, provider: Provider, repository: &str, run_id: &str) {
-        self.jobs
-            .write()
-            .expect("job store lock poisoned")
-            .retain(|_, j| {
-                !(j.provider == provider
-                    && j.repository.eq_ignore_ascii_case(repository)
-                    && j.run_id == run_id)
-            });
+        let mut jobs = self.jobs.write().expect("job store lock poisoned");
+        let before = jobs.len();
+        jobs.retain(|_, j| {
+            !(j.provider == provider && j.repository.eq_ignore_ascii_case(repository) && j.run_id == run_id)
+        });
+        if jobs.len() != before {
+            drop(jobs);
+            self.changed();
+        }
     }
 
     /// Active jobs first, oldest first; then finished jobs, newest first.
@@ -137,10 +167,13 @@ impl Store {
     /// Drop jobs not seen within the retention window.
     pub fn prune(&self, now: DateTime<Utc>) {
         let cutoff = now - self.retention;
-        self.jobs
-            .write()
-            .expect("job store lock poisoned")
-            .retain(|_, j| j.observed_at >= cutoff);
+        let mut jobs = self.jobs.write().expect("job store lock poisoned");
+        let before = jobs.len();
+        jobs.retain(|_, j| j.observed_at >= cutoff);
+        if jobs.len() != before {
+            drop(jobs);
+            self.changed();
+        }
     }
 
     pub fn record_success(&self, source: &str, at: DateTime<Utc>) {
@@ -246,6 +279,42 @@ pub(crate) mod tests {
         store.prune(t);
         let ids: Vec<_> = store.snapshot().into_iter().map(|j| j.id).collect();
         assert_eq!(ids, ["new"]);
+    }
+
+    #[test]
+    fn restore_prunes_and_keeps_held_jobs() {
+        let store = Store::new(Duration::hours(1));
+        let t = Utc::now();
+        store.upsert(job("held", State::Running, t));
+        let before = store.changes();
+        store.restore(
+            vec![
+                job("old", State::Success, t - Duration::hours(2)),
+                job("kept", State::Failure, t - Duration::minutes(30)),
+                job("held", State::Success, t - Duration::minutes(30)),
+            ],
+            t,
+        );
+        assert!(store.changes() > before);
+        let mut jobs = store.snapshot();
+        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<_> = jobs.iter().map(|j| (j.id.as_str(), j.state)).collect();
+        assert_eq!(ids, [("held", State::Running), ("kept", State::Failure)]);
+    }
+
+    #[test]
+    fn changes_count_only_real_changes() {
+        let store = Store::new(Duration::hours(1));
+        let t = Utc::now();
+        let start = store.changes();
+        store.prune(t);
+        store.remove_run(Provider::Github, "o/r", "1");
+        assert_eq!(store.changes(), start);
+        store.upsert(job("1", State::Queued, t));
+        let after_upsert = store.changes();
+        assert!(after_upsert > start);
+        store.remove_run(Provider::Github, "O/R", "1");
+        assert!(store.changes() > after_upsert);
     }
 
     #[test]

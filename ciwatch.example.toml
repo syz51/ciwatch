@@ -9,6 +9,10 @@ listen = "127.0.0.1:8080"
 # Jobs not updated for this long are dropped.
 retention_hours = 24
 
+# Optional: save jobs here (relative to this file) every 30 seconds and on
+# shutdown, and restore them at start. The directory must be writable.
+# state_file = "/var/lib/ciwatch/state.json"
+
 [github]
 # Enables POST /webhooks/github. Subscribe the webhook (or GitHub App) to
 # "Workflow jobs" with content type application/json and this secret.

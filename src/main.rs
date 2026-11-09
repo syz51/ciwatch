@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 use ciwatch::config::Config;
 use ciwatch::pools::Pools;
 use ciwatch::server::{self, Limits};
+use ciwatch::state_file::{self, Saver};
 use ciwatch::store::Store;
 use ciwatch::web::{AppState, page_router, router, webhook_router};
 use ciwatch::{circleci, github, http_client};
@@ -40,6 +41,13 @@ async fn main() -> Result<()> {
     }
 
     let store = Arc::new(Store::new(config.retention));
+    // Restore before the pollers start, so they refresh restored active runs.
+    let saver = config.state_file.map(|path| {
+        let saver = Saver::new(path.clone(), store.clone());
+        state_file::load(&path, &store, chrono::Utc::now());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        (stop, tokio::spawn(saver.run(stopped)))
+    });
     let pools = Arc::new(Pools::new(config.pools.clone()));
     let client = http_client().context("building HTTP client")?;
     let mut tasks = JoinSet::new();
@@ -128,6 +136,13 @@ async fn main() -> Result<()> {
         servers.abort_all();
     }
     tasks.shutdown().await;
+    // Last, so the final save holds what the draining listeners received.
+    if let Some((stop, saver)) = saver {
+        let _ = stop.send(());
+        if let Err(e) = saver.await {
+            tracing::error!(error = %e, "the state file saver failed");
+        }
+    }
     result
 }
 
