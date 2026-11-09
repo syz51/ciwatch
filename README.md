@@ -77,17 +77,22 @@ job up.
 ## State file
 
 With `state_file` set, ciwatch restores the saved jobs at start and drops
-those older than the retention window. It saves the jobs every 30 seconds
-when they changed, and once more on shutdown. Each save writes a temporary
-file (`<state_file>.tmp`, mode 0600) next to the file, flushes it to disk,
-renames it over the file and flushes the directory, so a crash leaves the
-old file or the new one. The directory must be writable.
+those older than the retention window. A queued, waiting or running job is
+restored only when its repository or project is polled, since nothing else
+would update it. ciwatch saves once at start, then every 30 seconds when a
+job was added, removed or changed (a poll that only sees a job again does not
+count), and once more on shutdown. Each save writes a temporary file
+(`<state_file>.tmp`, mode 0600) next to the file, flushes it to disk, renames
+it over the file and flushes the directory, so a crash leaves the old file or
+the new one. The directory must be writable, and only one ciwatch process may
+use the file.
 
-A file that cannot be read or decoded is logged as an error and ciwatch
-starts empty; it never stops the server. The next save replaces it. Load
-and save outcomes appear as the `state-file` source in `/api/jobs` and in
-the source metrics. The file holds what `/api/jobs` shows, so protect it the
-same way.
+A file that cannot be read or decoded is logged as an error, moved aside to
+`<state_file>.bad` (replacing an earlier one), and ciwatch starts empty; it
+never stops the server. A single job that cannot be decoded, such as one
+written by a newer release, is skipped and counted as an error. Load and save
+outcomes appear as the `state-file` source in `/api/jobs` and in the source
+metrics. The file holds what `/api/jobs` shows, so protect it the same way.
 
 ## Endpoints
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
+use crate::model::{Job, Provider};
 use crate::pools::PoolRule;
 
 /// Where a secret comes from. Values never appear in the file itself.
@@ -144,6 +145,27 @@ pub struct CircleciConfig {
 }
 
 impl Config {
+    /// Whether a poller refreshes `job`'s run, so a restored active job will
+    /// be updated: its repository or project is polled.
+    pub fn polls(&self, job: &Job) -> bool {
+        match job.provider {
+            Provider::Github => self
+                .github
+                .as_ref()
+                .and_then(|g| g.poll.as_ref())
+                .is_some_and(|p| {
+                    p.repositories
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&job.repository))
+                }),
+            Provider::Circleci => self.circleci.as_ref().is_some_and(|c| {
+                c.projects
+                    .iter()
+                    .any(|s| crate::circleci::repository_of(s).eq_ignore_ascii_case(&job.repository))
+            }),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading config {}", path.display()))?;
@@ -156,8 +178,9 @@ impl Config {
         let raw: RawConfig = toml::from_str(text).context("parsing config")?;
         let retention = hours("retention_hours", raw.retention_hours)?;
         if let Some(path) = &raw.state_file {
+            let last = path.as_os_str().as_encoded_bytes().rsplit(|b| *b == b'/').next();
             ensure!(
-                path.file_name().is_some() && !path.as_os_str().as_encoded_bytes().ends_with(b"/"),
+                !matches!(last, None | Some(b"" | b"." | b"..")),
                 "state_file {} does not name a file",
                 path.display()
             );
@@ -357,6 +380,40 @@ mod tests {
     }
 
     #[test]
+    fn polls_only_configured_repositories() {
+        let dir = SecretDir::new("polls");
+        let config = Config::parse(
+            r#"
+            [github]
+            webhook_secret = { file = "secret" }
+            token = { file = "secret" }
+            repositories = ["syz51/vps"]
+            [circleci]
+            token = { file = "secret" }
+            projects = ["gh/syz51/email-agent"]
+            "#,
+            &dir.0,
+        )
+        .unwrap();
+        let t = chrono::Utc::now();
+        let mut job = crate::store::tests::job("1", crate::model::State::Queued, t);
+        for (provider, repository, polled) in [
+            (Provider::Github, "Syz51/VPS", true),
+            (Provider::Github, "syz51/email-agent", false),
+            (Provider::Circleci, "syz51/email-agent", true),
+            (Provider::Circleci, "syz51/vps", false),
+        ] {
+            job.provider = provider;
+            job.repository = repository.into();
+            assert_eq!(config.polls(&job), polled, "{provider:?} {repository}");
+        }
+        let webhook_only = Config::parse("[github]\nwebhook_secret = { file = \"secret\" }", &dir.0).unwrap();
+        job.provider = Provider::Github;
+        job.repository = "syz51/vps".into();
+        assert!(!webhook_only.polls(&job));
+    }
+
+    #[test]
     fn resolves_the_state_file() {
         let dir = SecretDir::new("state-file");
         for (value, expected) in [
@@ -397,6 +454,10 @@ mod tests {
             ),
             (
                 "state_file = \"..\"\n[github]\nwebhook_secret = { file = \"secret\" }",
+                "does not name a file",
+            ),
+            (
+                "state_file = \"/var/lib/ciwatch/.\"\n[github]\nwebhook_secret = { file = \"secret\" }",
                 "does not name a file",
             ),
             ("[github]\nrepositories = [\"a/b\"]", "needs github.token"),

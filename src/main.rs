@@ -42,9 +42,9 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(Store::new(config.retention));
     // Restore before the pollers start, so they refresh restored active runs.
-    let saver = config.state_file.map(|path| {
+    let mut saver = config.state_file.clone().map(|path| {
         let saver = Saver::new(path.clone(), store.clone());
-        state_file::load(&path, &store, chrono::Utc::now());
+        state_file::load(&path, &store, chrono::Utc::now(), |job| config.polls(job));
         let (stop, stopped) = tokio::sync::oneshot::channel();
         (stop, tokio::spawn(saver.run(stopped)))
     });
@@ -119,11 +119,22 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Servers return only after shutdown; background tasks loop forever, so
-    // either ending otherwise means it panicked.
+    // Servers return only after shutdown; background tasks loop forever; the
+    // saver, kept out of `tasks` so that it is never aborted mid-write, runs
+    // until its stop signal. Any of them ending otherwise means it panicked.
+    let saver_ended = async {
+        match &mut saver {
+            Some((_, handle)) => handle.await,
+            None => std::future::pending().await,
+        }
+    };
     let mut result = tokio::select! {
         Some(served) = servers.join_next() => served.context("HTTP server task"),
         Some(ended) = tasks.join_next() => Err(anyhow::anyhow!("a background task stopped: {ended:?}")),
+        ended = saver_ended => {
+            saver = None;
+            Err(anyhow::anyhow!("the state file saver stopped: {ended:?}"))
+        }
     };
     if result.is_ok() {
         // Shutdown: the other listener drains too.

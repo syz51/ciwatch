@@ -2,8 +2,9 @@
 //!
 //! The file is JSON, `{"version": 1, "jobs": [...]}`, with each job in the
 //! `/api/jobs` shape. It is replaced atomically, so a reader sees either the
-//! old file or the new one. A file that cannot be read starts ciwatch empty;
-//! it never stops the server.
+//! old file or the new one. A file that cannot be read is moved aside to
+//! `<file>.bad` and ciwatch starts empty; it never stops the server. A job
+//! that cannot be decoded, such as one from a newer release, is skipped.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -31,14 +32,23 @@ struct SavedRef<'a> {
     jobs: &'a [Job],
 }
 
+/// Jobs stay undecoded until the version is checked, and each one is
+/// decoded on its own, so one bad job does not cost the others.
 #[derive(Deserialize)]
 struct Saved {
     version: u32,
-    jobs: Vec<Job>,
+    jobs: Vec<serde_json::Value>,
+}
+
+/// Jobs read from the file, and how many could not be decoded.
+#[derive(Debug, PartialEq)]
+pub struct Loaded {
+    pub jobs: Vec<Job>,
+    pub skipped: usize,
 }
 
 /// Read saved jobs; `None` when the file does not exist.
-pub fn read(path: &Path) -> Result<Option<Vec<Job>>> {
+pub fn read(path: &Path) -> Result<Option<Loaded>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -52,7 +62,22 @@ pub fn read(path: &Path) -> Result<Option<Vec<Job>>> {
         path.display(),
         saved.version
     );
-    Ok(Some(saved.jobs))
+    let total = saved.jobs.len();
+    let jobs: Vec<Job> = saved
+        .jobs
+        .into_iter()
+        .filter_map(|job| serde_json::from_value(job).ok())
+        .collect();
+    Ok(Some(Loaded {
+        skipped: total - jobs.len(),
+        jobs,
+    }))
+}
+
+fn aside_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bad");
+    path.with_file_name(name)
 }
 
 /// Replace the file with `jobs`: write a temporary file next to it, flush it
@@ -116,19 +141,34 @@ fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Restore saved jobs into the store at start. Logs and records any failure
-/// under [`SOURCE`]; the store stays empty then.
-pub fn load(path: &Path, store: &Store, now: DateTime<Utc>) {
+/// Restore saved jobs into the store at start; active jobs only when
+/// `refreshed` says a poller will update them. Logs and records any failure
+/// under [`SOURCE`]. A file that cannot be read is moved to `<file>.bad`, so
+/// the next save does not destroy it, and the store stays empty.
+pub fn load(path: &Path, store: &Store, now: DateTime<Utc>, refreshed: impl Fn(&Job) -> bool) {
     store.register_source(SOURCE);
     match read(path) {
-        Ok(Some(jobs)) => {
-            let saved = jobs.len();
-            store.restore(jobs, now);
-            tracing::info!(path = %path.display(), saved, kept = store.snapshot().len(), "restored jobs");
+        Ok(Some(Loaded { jobs, skipped })) => {
+            let saved = jobs.len() + skipped;
+            store.restore(jobs, now, refreshed);
+            tracing::info!(path = %path.display(), saved, kept = store.len(), "restored jobs");
+            if skipped > 0 {
+                let message = format!(
+                    "skipped {skipped} undecodable jobs in state file {}",
+                    path.display()
+                );
+                tracing::error!(error = %message, "cannot restore some jobs");
+                store.record_error(SOURCE, now, message);
+            }
         }
         Ok(None) => tracing::info!(path = %path.display(), "no state file yet; starting empty"),
         Err(e) => {
-            let message = format!("{e:#}");
+            let aside = aside_path(path);
+            let moved = match fs::rename(path, &aside) {
+                Ok(()) => format!("; moved it to {}", aside.display()),
+                Err(e) => format!("; cannot move it to {}: {e}", aside.display()),
+            };
+            let message = format!("{e:#}{moved}");
             tracing::error!(error = %message, "cannot load the state file; starting empty");
             store.record_error(SOURCE, now, message);
         }
@@ -139,25 +179,29 @@ pub fn load(path: &Path, store: &Store, now: DateTime<Utc>) {
 pub struct Saver {
     path: PathBuf,
     store: Arc<Store>,
-    saved: u64,
+    /// `None` until the first successful save.
+    saved: Option<u64>,
 }
 
 impl Saver {
-    /// A saver that treats the store's current contents as saved. Create it
-    /// before [`load`], so the first tick rewrites the file without the jobs
-    /// the restore pruned, and shows early whether the file can be written.
+    /// A saver whose first save always writes, so it rewrites the file without
+    /// the jobs the restore pruned and shows at once whether the file can be
+    /// written.
     pub fn new(path: PathBuf, store: Arc<Store>) -> Self {
-        let saved = store.changes();
-        Self { path, store, saved }
+        Self {
+            path,
+            store,
+            saved: None,
+        }
     }
 
     /// Save if the store changed, recording the outcome under [`SOURCE`].
     pub async fn save_if_changed(&mut self) {
         let changes = self.store.changes();
-        if changes == self.saved {
+        if self.saved == Some(changes) {
             return;
         }
-        let jobs = self.store.snapshot();
+        let jobs = self.store.jobs();
         let path = self.path.clone();
         let written = tokio::task::spawn_blocking(move || write(&path, &jobs))
             .await
@@ -165,7 +209,7 @@ impl Saver {
             .and_then(|r| r);
         match written {
             Ok(()) => {
-                self.saved = changes;
+                self.saved = Some(changes);
                 self.store.record_success(SOURCE, Utc::now());
             }
             Err(e) => {
@@ -224,9 +268,25 @@ mod tests {
     }
 
     fn ids(store: &Store) -> Vec<String> {
-        let mut ids: Vec<_> = store.snapshot().into_iter().map(|j| j.id).collect();
+        let mut ids: Vec<_> = store.jobs().into_iter().map(|j| j.id).collect();
         ids.sort();
         ids
+    }
+
+    fn read_ids(path: &Path) -> Vec<String> {
+        let mut ids: Vec<_> = read(path)
+            .unwrap()
+            .unwrap()
+            .jobs
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn every_job(_: &Job) -> bool {
+        true
     }
 
     #[test]
@@ -239,7 +299,7 @@ mod tests {
         done.labels = vec!["sai-ephemeral".into()];
         let jobs = vec![done, job("2", State::Waiting, t)];
         write(&dir.file(), &jobs).unwrap();
-        assert_eq!(read(&dir.file()).unwrap(), Some(jobs));
+        assert_eq!(read(&dir.file()).unwrap(), Some(Loaded { jobs, skipped: 0 }));
         assert!(!temp_path(&dir.file()).exists());
         #[cfg(unix)]
         {
@@ -268,13 +328,51 @@ mod tests {
         )
         .unwrap();
         let store = Store::new(chrono::Duration::hours(24));
-        load(&dir.file(), &store, t);
+        load(&dir.file(), &store, t, every_job);
         assert_eq!(ids(&store), ["recent"]);
         assert_eq!(store.sources()[SOURCE].errors_total, 0);
     }
 
     #[test]
-    fn a_corrupt_file_starts_empty_and_records_the_error() {
+    fn load_keeps_active_jobs_only_when_refreshed() {
+        let dir = TestDir::new("active");
+        let t = Utc::now();
+        let mut polled = job("polled", State::Running, t);
+        polled.repository = "o/polled".into();
+        polled.run_id = "1".into();
+        let mut orphan = job("orphan", State::Queued, t);
+        orphan.repository = "o/gone".into();
+        orphan.run_id = "2".into();
+        let mut finished = job("finished", State::Success, t);
+        finished.repository = "o/gone".into();
+        finished.run_id = "3".into();
+        write(&dir.file(), &[polled, orphan, finished]).unwrap();
+        let store = Store::new(chrono::Duration::hours(24));
+        load(&dir.file(), &store, t, |j| j.repository == "o/polled");
+        assert_eq!(ids(&store), ["finished", "polled"]);
+    }
+
+    #[test]
+    fn an_undecodable_job_is_skipped() {
+        let dir = TestDir::new("skip");
+        let t = Utc::now();
+        write(&dir.file(), &[job("good", State::Success, t)]).unwrap();
+        let mut saved: serde_json::Value = serde_json::from_slice(&fs::read(dir.file()).unwrap()).unwrap();
+        let mut newer = saved["jobs"][0].clone();
+        newer["id"] = "newer".into();
+        newer["state"] = "blocked".into();
+        saved["jobs"].as_array_mut().unwrap().push(newer);
+        fs::write(dir.file(), saved.to_string()).unwrap();
+
+        let store = Store::new(chrono::Duration::hours(24));
+        load(&dir.file(), &store, t, every_job);
+        assert_eq!(ids(&store), ["good"]);
+        assert_eq!(store.sources()[SOURCE].errors_total, 1);
+        assert!(dir.file().exists());
+    }
+
+    #[test]
+    fn a_corrupt_file_is_moved_aside_and_starts_empty() {
         let dir = TestDir::new("corrupt");
         for (i, text) in [
             "{\"version\": 1, \"jobs\": [",
@@ -286,12 +384,19 @@ mod tests {
         {
             fs::write(dir.file(), text).unwrap();
             let store = Store::new(chrono::Duration::hours(24));
-            load(&dir.file(), &store, Utc::now());
-            assert!(store.snapshot().is_empty(), "case {i}");
+            load(&dir.file(), &store, Utc::now(), every_job);
+            assert_eq!(store.len(), 0, "case {i}");
             let health = &store.sources()[SOURCE];
             assert_eq!(health.errors_total, 1, "case {i}");
+            let error = health.last_error.as_deref().unwrap();
             assert!(
-                health.last_error.as_deref().unwrap().contains("state file"),
+                error.contains("state file") && error.contains("moved it to"),
+                "case {i}: {error}"
+            );
+            assert!(!dir.file().exists(), "case {i}");
+            assert_eq!(
+                fs::read_to_string(aside_path(&dir.file())).unwrap(),
+                text,
                 "case {i}"
             );
         }
@@ -303,8 +408,8 @@ mod tests {
         // A directory in place of the file cannot be read as one.
         fs::create_dir(dir.file()).unwrap();
         let store = Store::new(chrono::Duration::hours(24));
-        load(&dir.file(), &store, Utc::now());
-        assert!(store.snapshot().is_empty());
+        load(&dir.file(), &store, Utc::now(), every_job);
+        assert_eq!(store.len(), 0);
         assert_eq!(store.sources()[SOURCE].errors_total, 1);
     }
 
@@ -312,33 +417,28 @@ mod tests {
     fn a_failed_write_keeps_the_previous_file() {
         let dir = TestDir::new("atomic");
         let t = Utc::now();
-        let first = vec![job("1", State::Success, t)];
-        write(&dir.file(), &first).unwrap();
+        write(&dir.file(), &[job("1", State::Success, t)]).unwrap();
         // The temporary file's path is taken, so the next write fails before
         // it can touch the file.
         fs::create_dir(temp_path(&dir.file())).unwrap();
         assert!(write(&dir.file(), &[job("2", State::Success, t)]).is_err());
-        assert_eq!(read(&dir.file()).unwrap(), Some(first));
+        assert_eq!(read_ids(&dir.file()), ["1"]);
         // A leftover temporary file from a crash is overwritten.
         fs::remove_dir(temp_path(&dir.file())).unwrap();
         fs::write(temp_path(&dir.file()), "partial").unwrap();
-        let second = vec![job("2", State::Failure, t)];
-        write(&dir.file(), &second).unwrap();
-        assert_eq!(read(&dir.file()).unwrap(), Some(second));
+        write(&dir.file(), &[job("2", State::Failure, t)]).unwrap();
+        assert_eq!(read_ids(&dir.file()), ["2"]);
         assert!(!temp_path(&dir.file()).exists());
     }
 
     #[tokio::test]
-    async fn saves_only_after_a_change() {
+    async fn saves_at_once_then_only_after_a_change() {
         let dir = TestDir::new("saver");
         let store = Arc::new(Store::new(chrono::Duration::hours(24)));
         let mut saver = Saver::new(dir.file(), store.clone());
+        // The first save writes even an empty store.
         saver.save_if_changed().await;
-        assert!(!dir.file().exists());
-
-        store.upsert(job("1", State::Success, Utc::now()));
-        saver.save_if_changed().await;
-        assert_eq!(read(&dir.file()).unwrap().unwrap().len(), 1);
+        assert_eq!(read_ids(&dir.file()), Vec::<String>::new());
         assert!(store.sources()[SOURCE].last_success.is_some());
 
         // Unchanged: the file is left alone, even when it went away.
@@ -346,11 +446,15 @@ mod tests {
         saver.save_if_changed().await;
         assert!(!dir.file().exists());
 
+        store.upsert(job("1", State::Success, Utc::now()));
+        saver.save_if_changed().await;
+        assert_eq!(read_ids(&dir.file()), ["1"]);
+
         // A restart restores what was saved.
         store.upsert(job("2", State::Failure, Utc::now()));
         saver.save_if_changed().await;
         let restarted = Store::new(chrono::Duration::hours(24));
-        load(&dir.file(), &restarted, Utc::now());
+        load(&dir.file(), &restarted, Utc::now(), every_job);
         assert_eq!(ids(&restarted), ["1", "2"]);
     }
 
@@ -368,15 +472,9 @@ mod tests {
         .unwrap();
         let store = Arc::new(Store::new(chrono::Duration::hours(24)));
         let mut saver = Saver::new(dir.file(), store.clone());
-        load(&dir.file(), &store, t);
+        load(&dir.file(), &store, t, every_job);
         saver.save_if_changed().await;
-        let saved: Vec<_> = read(&dir.file())
-            .unwrap()
-            .unwrap()
-            .into_iter()
-            .map(|j| j.id)
-            .collect();
-        assert_eq!(saved, ["recent"]);
+        assert_eq!(read_ids(&dir.file()), ["recent"]);
     }
 
     #[tokio::test]
@@ -384,11 +482,13 @@ mod tests {
         let dir = TestDir::new("stop");
         let store = Arc::new(Store::new(chrono::Duration::hours(24)));
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let saver = tokio::spawn(Saver::new(dir.file(), store.clone()).run(stop_rx));
         store.upsert(job("1", State::Success, Utc::now()));
+        let saver = tokio::spawn(Saver::new(dir.file(), store.clone()).run(stop_rx));
+        tokio::task::yield_now().await;
+        store.upsert(job("2", State::Success, Utc::now()));
         stop_tx.send(()).unwrap();
         saver.await.unwrap();
-        assert_eq!(read(&dir.file()).unwrap().unwrap().len(), 1);
+        assert_eq!(read_ids(&dir.file()), ["1", "2"]);
     }
 
     #[tokio::test]
@@ -402,6 +502,6 @@ mod tests {
         assert_eq!(store.sources()[SOURCE].errors_total, 1);
         fs::create_dir(dir.0.join("missing")).unwrap();
         saver.save_if_changed().await;
-        assert_eq!(read(&missing).unwrap().unwrap().len(), 1);
+        assert_eq!(read_ids(&missing), ["1"]);
     }
 }

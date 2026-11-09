@@ -52,7 +52,8 @@ impl Store {
         }
     }
 
-    /// A number that grows whenever the jobs change.
+    /// A number that grows whenever a job is added, removed or changed in
+    /// more than `observed_at`.
     pub fn changes(&self) -> u64 {
         self.changes.load(Ordering::Acquire)
     }
@@ -62,12 +63,16 @@ impl Store {
     }
 
     /// Add jobs saved by an earlier run, then drop those older than the
-    /// retention window. A job already held is kept as it is.
-    pub fn restore(&self, saved: Vec<Job>, now: DateTime<Utc>) {
+    /// retention window. An active job is added only when `refreshed` says a
+    /// poller will update it; otherwise nothing would ever finish it. A job
+    /// already held is kept as it is.
+    pub fn restore(&self, saved: Vec<Job>, now: DateTime<Utc>, refreshed: impl Fn(&Job) -> bool) {
         {
             let mut jobs = self.jobs.write().expect("job store lock poisoned");
             for job in saved {
-                jobs.entry(job.key()).or_insert(job);
+                if !job.state.is_active() || refreshed(&job) {
+                    jobs.entry(job.key()).or_insert(job);
+                }
             }
         }
         self.changed();
@@ -82,6 +87,7 @@ impl Store {
         match jobs.get_mut(&job.key()) {
             Some(existing) if existing.state.progress() > job.state.progress() => {
                 existing.observed_at = existing.observed_at.max(job.observed_at);
+                return;
             }
             Some(existing) => {
                 job.created_at = existing.created_at.or(job.created_at);
@@ -89,10 +95,18 @@ impl Store {
                 if job.runner.is_none() && existing.runner.is_some() {
                     // The pool was classified with the runner known; an
                     // update without it cannot classify better.
-                    job.runner = existing.runner.take();
-                    job.pool = std::mem::take(&mut existing.pool);
+                    job.runner = existing.runner.clone();
+                    job.pool = existing.pool.clone();
                 }
+                let observed_only = Job {
+                    observed_at: existing.observed_at,
+                    ..job.clone()
+                } == *existing;
                 *existing = job;
+                if observed_only {
+                    // A poll that only saw the job again is not worth a save.
+                    return;
+                }
             }
             None => {
                 job.created_at = job.created_at.or(Some(job.observed_at));
@@ -137,6 +151,24 @@ impl Store {
             drop(jobs);
             self.changed();
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.read().expect("job store lock poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every job, in no particular order.
+    pub fn jobs(&self) -> Vec<Job> {
+        self.jobs
+            .read()
+            .expect("job store lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Active jobs first, oldest first; then finished jobs, newest first.
@@ -294,6 +326,7 @@ pub(crate) mod tests {
                 job("held", State::Success, t - Duration::minutes(30)),
             ],
             t,
+            |_| true,
         );
         assert!(store.changes() > before);
         let mut jobs = store.snapshot();
@@ -313,8 +346,17 @@ pub(crate) mod tests {
         store.upsert(job("1", State::Queued, t));
         let after_upsert = store.changes();
         assert!(after_upsert > start);
+        // Seen again, or a late update: only observed_at moves.
+        store.upsert(job("1", State::Queued, t + Duration::seconds(30)));
+        assert_eq!(store.changes(), after_upsert);
+        store.upsert(job("1", State::Running, t + Duration::seconds(60)));
+        let after_start = store.changes();
+        assert!(after_start > after_upsert);
+        store.upsert(job("1", State::Queued, t + Duration::seconds(90)));
+        assert_eq!(store.changes(), after_start);
+        assert_eq!(store.jobs()[0].observed_at, t + Duration::seconds(90));
         store.remove_run(Provider::Github, "O/R", "1");
-        assert!(store.changes() > after_upsert);
+        assert!(store.changes() > after_start);
     }
 
     #[test]
